@@ -29,7 +29,7 @@ flowchart LR
 - Official-first recovery with configurable `repair.official_steps`
 - Incident bundles under `~/.fix-my-claw/attempts/<timestamp>/`
 - Cooldowns, stale-lock cleanup, and single-instance protection
-- Optional AI-assisted remediation with conservative defaults
+- AI-assisted remediation enabled in the default config
 - Ready-to-use systemd units for long-running or timer-based deployment
 
 ## Installation
@@ -147,9 +147,9 @@ Notes for systemd hosts:
 - The sample unit runs `/usr/bin/env fix-my-claw ...`. If you installed inside a virtualenv, replace `ExecStart` with the absolute path to that virtualenv's `fix-my-claw` binary.
 - If `openclaw` is not found in the systemd environment, set `[openclaw].command` to an absolute path.
 
-## Optional AI-Assisted Remediation
+## AI-Assisted Remediation
 
-AI-assisted remediation is disabled by default.
+AI-assisted remediation is enabled in the default config.
 
 When `provider = "auto"`:
 
@@ -183,7 +183,7 @@ local = true
 timeout_seconds = 1800
 ```
 
-This mode is intended for unattended hosts where you are comfortable allowing non-interactive remediation.
+If you want official repair steps only, set `[ai].enabled = false`.
 
 ## Trade-offs
 

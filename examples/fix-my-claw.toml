@@ -29,8 +29,8 @@ step_timeout_seconds = 600
 post_step_wait_seconds = 2
 
 [ai]
-# AI-assisted remediation is powerful and risky; enable only if you accept unattended execution.
-enabled = false
+# AI-assisted remediation is enabled by default; disable it only if you want official repair steps only.
+enabled = true
 provider = "auto"
 command = "codex"
 # For provider = "openclaw", fix-my-claw will call `openclaw agent`.

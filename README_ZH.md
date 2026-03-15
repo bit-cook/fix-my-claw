@@ -29,7 +29,7 @@ flowchart LR
 - 先走官方修复步骤，再决定是否升级到 AI 修复
 - 每次修复都在 `~/.fix-my-claw/attempts/<timestamp>/` 下保留现场
 - 内置冷却、过期锁清理和单实例保护，避免抖动
-- AI 辅助修复默认关闭，权限边界保守
+- 默认配置已开启 AI 辅助修复
 - 自带 systemd 服务与定时器部署文件
 
 ## 安装
@@ -147,9 +147,9 @@ systemd 主机上的注意事项：
 - 示例 unit 使用的是 `/usr/bin/env fix-my-claw ...`。如果你把它装在虚拟环境里，请把 `ExecStart` 改成虚拟环境里 `fix-my-claw` 的绝对路径。
 - 如果 systemd 环境里找不到 `openclaw`，请把 `[openclaw].command` 配成绝对路径。
 
-## 可选的 AI 辅助修复
+## AI 辅助修复
 
-AI 辅助修复默认关闭。
+默认配置已开启 AI 辅助修复。
 
 当 `provider = "auto"` 时：
 
@@ -183,7 +183,7 @@ local = true
 timeout_seconds = 1800
 ```
 
-这个模式适合你明确接受无人确认修复的机器。
+如果你只想保留官方修复步骤，可以把 `[ai].enabled = false`。
 
 ## 取舍与边界
 

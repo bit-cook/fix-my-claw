@@ -34,6 +34,11 @@ class ProbeEffectiveOkTests(unittest.TestCase):
 
 
 class BuildAiInvocationTests(unittest.TestCase):
+    def test_ai_defaults_enabled(self) -> None:
+        cfg = AiConfig()
+
+        self.assertTrue(cfg.enabled)
+
     def test_codex_provider_uses_stdin_prompt(self) -> None:
         cfg = AppConfig()
 

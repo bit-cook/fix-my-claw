@@ -51,7 +51,7 @@ step_timeout_seconds = 600
 post_step_wait_seconds = 2
 
 [ai]
-enabled = false
+enabled = true
 provider = "auto"
 command = "codex"
 agent_id = "main"
@@ -257,7 +257,7 @@ class RepairConfig:
 
 @dataclass(frozen=True)
 class AiConfig:
-    enabled: bool = False
+    enabled: bool = True
     provider: str = "auto"  # auto | codex | openclaw
     command: str = "codex"
     agent_id: str | None = "main"
