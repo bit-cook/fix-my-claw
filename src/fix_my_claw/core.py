@@ -52,11 +52,17 @@ post_step_wait_seconds = 2
 
 [ai]
 enabled = true
+backend = "direct"
 provider = "auto"
 command = "codex"
 agent_id = "main"
 local = false
 agent_args = []
+acpx_command = "acpx"
+acpx_args = []
+acpx_permissions = "approve-all"
+acpx_non_interactive_permissions = "fail"
+acpx_format = "json"
 args = [
   "exec",
   "-s", "workspace-write",
@@ -258,11 +264,17 @@ class RepairConfig:
 @dataclass(frozen=True)
 class AiConfig:
     enabled: bool = True
-    provider: str = "auto"  # auto | codex | openclaw
+    backend: str = "direct"  # direct | acpx
+    provider: str = "auto"  # auto | codex | claude | openclaw
     command: str = "codex"
     agent_id: str | None = "main"
     local: bool = False
     agent_args: list[str] = field(default_factory=list)
+    acpx_command: str = "acpx"
+    acpx_args: list[str] = field(default_factory=list)
+    acpx_permissions: str = "approve-all"  # approve-all | approve-reads | deny-all
+    acpx_non_interactive_permissions: str = "fail"  # fail | deny
+    acpx_format: str = "json"  # text | json | quiet
     # args supports placeholders: $workspace_dir, $openclaw_state_dir, $monitor_state_dir
     args: list[str] = field(
         default_factory=lambda: [
@@ -348,11 +360,19 @@ def _parse_ai(raw: dict[str, Any]) -> AiConfig:
     cfg = AiConfig()
     return AiConfig(
         enabled=bool(_get(raw, "enabled", cfg.enabled)),
+        backend=str(_get(raw, "backend", cfg.backend)),
         provider=str(_get(raw, "provider", cfg.provider)),
         command=str(_get(raw, "command", cfg.command)),
         agent_id=_get(raw, "agent_id", cfg.agent_id),
         local=bool(_get(raw, "local", cfg.local)),
         agent_args=list(_get(raw, "agent_args", cfg.agent_args)),
+        acpx_command=str(_get(raw, "acpx_command", cfg.acpx_command)),
+        acpx_args=list(_get(raw, "acpx_args", cfg.acpx_args)),
+        acpx_permissions=str(_get(raw, "acpx_permissions", cfg.acpx_permissions)),
+        acpx_non_interactive_permissions=str(
+            _get(raw, "acpx_non_interactive_permissions", cfg.acpx_non_interactive_permissions)
+        ),
+        acpx_format=str(_get(raw, "acpx_format", cfg.acpx_format)),
         args=list(_get(raw, "args", cfg.args)),
         model=_get(raw, "model", cfg.model),
         timeout_seconds=int(_get(raw, "timeout_seconds", cfg.timeout_seconds)),
@@ -525,12 +545,13 @@ def _log_startup(cfg: "AppConfig", *, mode: str, config_path: str) -> None:
         _as_path(config_path),
     )
     startup_log.info(
-        "openclaw=%s workspace=%s interval=%ss cooldown=%ss ai=%s/%s",
+        "openclaw=%s workspace=%s interval=%ss cooldown=%ss ai=%s/%s/%s",
         cfg.openclaw.command,
         cfg.openclaw.workspace_dir,
         cfg.monitor.interval_seconds,
         cfg.monitor.repair_cooldown_seconds,
         "on" if cfg.ai.enabled else "off",
+        cfg.ai.backend,
         cfg.ai.provider,
     )
 
@@ -939,9 +960,18 @@ def _normalize_ai_provider(provider: str) -> str:
     return provider.strip().lower().replace("_", "-")
 
 
+def _normalize_ai_backend(backend: str) -> str:
+    return backend.strip().lower().replace("_", "-")
+
+
 def _resolve_codex_ai_command(cfg: AppConfig) -> str:
     command = cfg.ai.command.strip()
     return command or "codex"
+
+
+def _resolve_acpx_ai_command(cfg: AppConfig) -> str:
+    command = cfg.ai.acpx_command.strip()
+    return command or "acpx"
 
 
 def _resolve_openclaw_ai_command(cfg: AppConfig) -> str:
@@ -967,8 +997,74 @@ def _unique_preserving_order(values: list[str]) -> list[str]:
     return out
 
 
+def _acpx_working_dir(cfg: AppConfig) -> Path:
+    candidates = [
+        cfg.openclaw.workspace_dir,
+        cfg.openclaw.state_dir,
+        cfg.monitor.state_dir,
+    ]
+    try:
+        common = Path(os.path.commonpath([str(path.resolve()) for path in candidates]))
+    except ValueError:
+        common = cfg.openclaw.workspace_dir
+
+    if str(common) in {"", os.sep}:
+        return cfg.openclaw.workspace_dir
+    return common
+
+
+def _build_acpx_invocation(
+    cfg: AppConfig,
+    provider: str,
+    *,
+    one_shot: bool,
+) -> list[str]:
+    backend_args = list(cfg.ai.acpx_args)
+    argv = [
+        _resolve_acpx_ai_command(cfg),
+        *backend_args,
+        "--cwd",
+        str(_acpx_working_dir(cfg)),
+    ]
+
+    permissions = _normalize_ai_provider(cfg.ai.acpx_permissions)
+    if permissions == "approve-all":
+        argv.append("--approve-all")
+    elif permissions == "deny-all":
+        argv.append("--deny-all")
+    else:
+        argv.append("--approve-reads")
+
+    output_format = _normalize_ai_provider(cfg.ai.acpx_format)
+    argv += ["--format", output_format if output_format in {"text", "json", "quiet"} else "json"]
+
+    non_interactive = _normalize_ai_provider(cfg.ai.acpx_non_interactive_permissions)
+    argv += ["--non-interactive-permissions", non_interactive if non_interactive in {"fail", "deny"} else "fail"]
+
+    if cfg.ai.timeout_seconds > 0:
+        argv += ["--timeout", str(cfg.ai.timeout_seconds)]
+
+    argv.append(provider)
+    if one_shot:
+        argv.append("exec")
+    argv += ["--file", "-"]
+    return argv
+
+
 def _resolve_ai_provider_candidates(cfg: AppConfig) -> list[str]:
+    backend = _normalize_ai_backend(cfg.ai.backend)
     provider = _normalize_ai_provider(cfg.ai.provider)
+    if backend == "acpx":
+        if provider in {"", "auto"}:
+            return ["codex", "claude"]
+        if provider == "claude":
+            return _unique_preserving_order(["claude", "codex"])
+        if provider == "codex":
+            return _unique_preserving_order(["codex", "claude"])
+        if provider in {"openclaw", "openclaw-agent"}:
+            return _unique_preserving_order(["openclaw", "codex", "claude"])
+        return [provider]
+
     if provider in {"", "auto"}:
         return ["codex", "openclaw"]
     if provider in {"openclaw", "openclaw-agent"}:
@@ -980,8 +1076,75 @@ def _resolve_ai_provider_candidates(cfg: AppConfig) -> list[str]:
 
 def _probe_ai_provider(cfg: AppConfig, provider: str) -> AiProviderProbe:
     timeout_seconds = min(max(5, cfg.monitor.probe_timeout_seconds), 15)
+    backend = _normalize_ai_backend(cfg.ai.backend)
     provider = _normalize_ai_provider(provider)
     cwd = _openclaw_cwd(cfg)
+
+    if backend == "acpx":
+        base_argv = [_resolve_acpx_ai_command(cfg), *cfg.ai.acpx_args, "--help"]
+        base_cmd = run_cmd(base_argv, timeout_seconds=timeout_seconds, cwd=cwd)
+        if not base_cmd.ok:
+            return AiProviderProbe(
+                provider=provider,
+                available=False,
+                reason="acpx-command-unavailable",
+                argv=base_argv,
+                exit_code=base_cmd.exit_code,
+                stdout=base_cmd.stdout,
+                stderr=base_cmd.stderr,
+            )
+
+        if provider == "claude":
+            argv = ["claude", "--help"]
+            cmd = run_cmd(argv, timeout_seconds=timeout_seconds, cwd=cwd)
+            return AiProviderProbe(
+                provider=provider,
+                available=cmd.ok,
+                reason="command-ok" if cmd.ok else "command-unavailable",
+                argv=argv,
+                exit_code=cmd.exit_code,
+                stdout=cmd.stdout,
+                stderr=cmd.stderr,
+            )
+
+        if provider == "codex":
+            argv = [_resolve_codex_ai_command(cfg), "exec", "--help"]
+            cmd = run_cmd(argv, timeout_seconds=timeout_seconds, cwd=cwd)
+            return AiProviderProbe(
+                provider=provider,
+                available=cmd.ok,
+                reason="command-ok" if cmd.ok else "command-unavailable",
+                argv=argv,
+                exit_code=cmd.exit_code,
+                stdout=cmd.stdout,
+                stderr=cmd.stderr,
+            )
+
+        if provider == "openclaw":
+            argv = [cfg.openclaw.command, "acp", "--help"]
+            cmd = run_cmd(argv, timeout_seconds=timeout_seconds, cwd=cwd)
+            gateway_ready = probe_status(cfg, log_on_fail=False).ok
+            available = cmd.ok and gateway_ready
+            reason = "gateway-rpc-ok" if available else "gateway-rpc-unavailable" if cmd.ok else "command-unavailable"
+            return AiProviderProbe(
+                provider=provider,
+                available=available,
+                reason=reason,
+                argv=argv,
+                exit_code=cmd.exit_code,
+                stdout=cmd.stdout,
+                stderr=cmd.stderr,
+            )
+
+        return AiProviderProbe(
+            provider=provider,
+            available=False,
+            reason="unsupported-provider",
+            argv=[],
+            exit_code=1,
+            stdout="",
+            stderr=f"unsupported acpx provider: {provider}",
+        )
 
     if provider == "openclaw":
         argv = [cfg.openclaw.command, "models", "status", "--check", "--json"]
@@ -1029,7 +1192,11 @@ def _build_ai_invocation(
     code_stage: bool,
     provider_override: str | None = None,
 ) -> tuple[list[str], str | None]:
+    backend = _normalize_ai_backend(cfg.ai.backend)
     provider = _normalize_ai_provider(provider_override or cfg.ai.provider)
+    if backend == "acpx":
+        return _build_acpx_invocation(cfg, provider, one_shot=True), prompt
+
     if provider in {"openclaw", "openclaw-agent"}:
         vars = {
             "workspace_dir": str(cfg.openclaw.workspace_dir),
@@ -1078,8 +1245,9 @@ def _run_ai_repair(
         provider_override=provider_name,
     )
     logging.getLogger("fix_my_claw.repair").warning(
-        "AI %s/%s run=%s",
+        "AI %s/%s/%s run=%s",
         "code" if code_stage else "config",
+        _normalize_ai_backend(cfg.ai.backend),
         provider_name,
         _format_argv(argv),
     )
@@ -1094,14 +1262,20 @@ def _run_ai_repair(
     _write_attempt_file(attempt_dir, f"ai.{suffix}.stdout.txt", redact_text(res.stdout))
     _write_attempt_file(attempt_dir, f"ai.{suffix}.stderr.txt", redact_text(res.stderr))
     logging.getLogger("fix_my_claw.repair").warning(
-        "AI %s/%s exit=%s duration=%s",
+        "AI %s/%s/%s exit=%s duration=%s",
         "code" if code_stage else "config",
+        _normalize_ai_backend(cfg.ai.backend),
         provider_name,
         res.exit_code,
         _format_duration_ms(res.duration_ms),
     )
     if res.stderr:
-        logging.getLogger("fix_my_claw.repair").warning("AI %s stderr=%s", provider_name, truncate_for_log(res.stderr))
+        logging.getLogger("fix_my_claw.repair").warning(
+            "AI %s/%s stderr=%s",
+            _normalize_ai_backend(cfg.ai.backend),
+            provider_name,
+            truncate_for_log(res.stderr),
+        )
     return res
 
 
@@ -1116,14 +1290,16 @@ def _attempt_ai_stage(cfg: AppConfig, attempt_dir: Path, *, code_stage: bool) ->
     )
 
     stage_details: dict[str, Any] = {
+        "backend": _normalize_ai_backend(cfg.ai.backend),
         "provider_order": providers,
         "provider_probes": [probe.to_json() for probe in probes],
         "attempts": [],
     }
     used_any = False
     repair_log.warning(
-        "%s stage providers=%s",
+        "%s stage backend=%s providers=%s",
         "code" if code_stage else "config",
+        _normalize_ai_backend(cfg.ai.backend),
         ", ".join(
             f"{probe.provider}:{'ok' if probe.available else 'skip'}"
             for probe in probes

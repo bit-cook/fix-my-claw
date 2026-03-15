@@ -116,8 +116,10 @@ fix-my-claw monitor --config /etc/fix-my-claw/config.toml
 | `[openclaw].allow_remote_mode` | 是否允许在 `gateway.mode=remote` 时继续运行 |
 | `[repair].official_steps` | 进入 AI 修复前的官方修复命令序列 |
 | `[ai].enabled` | 是否允许 AI 辅助修复 |
-| `[ai].provider` | `auto`、`codex` 或 `openclaw`；`auto` 会先本地探测这两条路 |
+| `[ai].backend` | `direct` 或 `acpx`；前者走原生 CLI，后者走 ACP 客户端接口层 |
+| `[ai].provider` | `auto`、`codex`、`claude` 或 `openclaw`；自动顺序取决于 backend |
 | `[ai].local` | 当 `provider = "openclaw"` 时，是否使用 `openclaw agent --local` 直接绕过 Gateway |
+| `[ai].acpx_permissions` | `acpx` 运行时使用的权限模式；无人值守修复通常需要 `approve-all` |
 | `[ai].allow_code_changes` | 是否允许第二阶段进行更宽松的代码或安装修改 |
 
 默认配置会把状态、日志和修复现场都放在 `~/.fix-my-claw` 下，便于排查和清理。
@@ -151,35 +153,54 @@ systemd 主机上的注意事项：
 
 默认配置已开启 AI 辅助修复。
 
-当 `provider = "auto"` 时：
+现在有两条 AI backend：
+
+- `backend = "direct"`：继续使用当前原生集成，例如 `codex exec` 和 `openclaw agent`
+- `backend = "acpx"`：通过 [`acpx`](https://github.com/openclaw/acpx) 这层 ACP 客户端/调度接口统一调用 coding agent
+
+当 `backend = "direct"` 且 `provider = "auto"` 时：
 
 - `fix-my-claw` 会先本地探测 `codex` 和 `openclaw` 这两条 AI 修复路径是否可用
 - 当前顺序是先 `codex`，再 `openclaw`
 - `codex` 通过 CLI 可执行性做快速检查，`openclaw` 通过 `openclaw models status --check --json` 做本地可用性检查
 - 如果前一个 provider 不可用，或执行后仍未修好，就会自动尝试下一个可用 provider
 
-当 `provider = "codex"` 时：
+当 `backend = "acpx"` 且 `provider = "auto"` 时：
+
+- `fix-my-claw` 会先探测 `codex`，再探测 `claude`
+- `acpx openclaw` 虽然支持，但不会被放进默认 `auto` 顺序，因为它底层依赖 `openclaw acp`，而后者是 Gateway-backed
+- 所以 `acpx` 很适合作为 Codex/Claude 这类 coding agent 的统一接口层，但不是 Gateway 宕机时 OpenClaw 修复的默认路径
+
+当使用 direct backend 且 `provider = "codex"` 时：
 
 - 第一阶段会以 `workspace-write` 模式运行 `codex exec`，并只附加明确允许的目录
 - 第二阶段依旧默认关闭，只有 `ai.allow_code_changes = true` 才会放开
 - 每日次数限制和冷却时间会降低同一主机反复触发 AI 修复的概率
 
-当 `provider = "openclaw"` 时：
+当使用 direct backend 且 `provider = "openclaw"` 时：
 
 - `fix-my-claw` 会执行 `openclaw agent`
 - 如果 Gateway 本身已经不健康，建议把 `local = true` 打开，直接走嵌入式 agent 路径
 - 这也是“Gateway 已宕机，但仍希望借 OpenClaw 已注册模型继续修复”的主要方式
 - 如果你显式固定 `provider = "openclaw"`，`codex` 仍会作为下一层 provider 级兜底
 
+当使用 `acpx` backend 时：
+
+- `fix-my-claw` 会执行 one-shot 的 `acpx <provider> exec --file -`
+- 默认 `acpx` 配置适合无人值守修复，会自动批准运行所需权限
+- 但 `acpx` 本身仍处于 alpha，生产环境更适合固定版本，而不是盲跟最新
+
 示例：
 
 ```toml
 [ai]
 enabled = true
+backend = "acpx"
 provider = "auto"
-command = "codex"
-agent_id = "main"
-local = true
+acpx_command = "acpx"
+acpx_permissions = "approve-all"
+acpx_non_interactive_permissions = "fail"
+acpx_format = "json"
 timeout_seconds = 1800
 ```
 
@@ -191,6 +212,7 @@ timeout_seconds = 1800
 - 如果你只需要定时检查，timer 方式可能比常驻监控更合适
 - 工具默认假设自己能读取 OpenClaw 的 workspace 和 state 目录
 - 如果 Gateway 已宕机，仍想使用 OpenClaw 已注册模型，必须走本地/嵌入式执行路径，例如 `openclaw agent --local`，或者直接走 provider 直连；常规 Gateway 路由在 Gateway 宕机时不可用
+- `acpx` 很适合作为统一 coding-agent interface，但它仍是 alpha，且它的 `openclaw` target 依赖 Gateway
 
 ## 文档
 

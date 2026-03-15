@@ -38,6 +38,7 @@ class BuildAiInvocationTests(unittest.TestCase):
         cfg = AiConfig()
 
         self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.backend, "direct")
 
     def test_codex_provider_uses_stdin_prompt(self) -> None:
         cfg = AppConfig()
@@ -60,15 +61,46 @@ class BuildAiInvocationTests(unittest.TestCase):
         self.assertIn("repair prompt", argv)
         self.assertIsNone(stdin_text)
 
+    def test_acpx_provider_uses_exec_with_stdin_prompt(self) -> None:
+        cfg = AppConfig(
+            ai=AiConfig(
+                backend="acpx",
+                provider="claude",
+                acpx_command="acpx",
+                acpx_permissions="approve-all",
+                acpx_non_interactive_permissions="fail",
+                acpx_format="json",
+            )
+        )
+
+        argv, stdin_text = _build_ai_invocation(cfg, "repair prompt", code_stage=False)
+
+        self.assertEqual(argv[0], "acpx")
+        self.assertIn("--cwd", argv)
+        self.assertIn("--approve-all", argv)
+        self.assertIn("--format", argv)
+        self.assertIn("json", argv)
+        self.assertIn("--non-interactive-permissions", argv)
+        self.assertEqual(argv[-4:], ["claude", "exec", "--file", "-"])
+        self.assertEqual(stdin_text, "repair prompt")
+
 
 class AiProviderSelectionTests(unittest.TestCase):
     def test_auto_provider_prefers_codex_then_openclaw(self) -> None:
         cfg = AppConfig(ai=AiConfig(provider="auto"))
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["codex", "openclaw"])
 
+    def test_acpx_auto_provider_prefers_codex_then_claude(self) -> None:
+        cfg = AppConfig(ai=AiConfig(backend="acpx", provider="auto"))
+        self.assertEqual(_resolve_ai_provider_candidates(cfg), ["codex", "claude"])
+
     def test_openclaw_provider_falls_back_to_codex(self) -> None:
         cfg = AppConfig(ai=AiConfig(provider="openclaw"))
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["openclaw", "codex"])
+
+    def test_acpx_openclaw_provider_falls_back_to_codex_and_claude(self) -> None:
+        cfg = AppConfig(ai=AiConfig(backend="acpx", provider="openclaw"))
+        self.assertEqual(_resolve_ai_provider_candidates(cfg), ["openclaw", "codex", "claude"])
 
     def test_openclaw_probe_treats_expiring_auth_as_available(self) -> None:
         cfg = AppConfig()
@@ -86,6 +118,40 @@ class AiProviderSelectionTests(unittest.TestCase):
         self.assertIsInstance(probe, AiProviderProbe)
         self.assertTrue(probe.available)
         self.assertEqual(probe.reason, "models-status-expiring-auth")
+
+    def test_acpx_claude_probe_requires_acpx_and_claude_command(self) -> None:
+        cfg = AppConfig(ai=AiConfig(backend="acpx", provider="claude", acpx_command="acpx"))
+        responses = [
+            CmdResult(argv=["acpx", "--help"], cwd=None, exit_code=0, duration_ms=1, stdout="", stderr=""),
+            CmdResult(argv=["claude", "--help"], cwd=None, exit_code=0, duration_ms=1, stdout="", stderr=""),
+        ]
+
+        with patch("fix_my_claw.core.run_cmd", side_effect=responses):
+            probe = _probe_ai_provider(cfg, "claude")
+
+        self.assertTrue(probe.available)
+        self.assertEqual(probe.reason, "command-ok")
+
+    def test_acpx_openclaw_probe_requires_gateway_rpc(self) -> None:
+        cfg = AppConfig(ai=AiConfig(backend="acpx", provider="openclaw", acpx_command="acpx"))
+        responses = [
+            CmdResult(argv=["acpx", "--help"], cwd=None, exit_code=0, duration_ms=1, stdout="", stderr=""),
+            CmdResult(argv=["openclaw", "acp", "--help"], cwd=None, exit_code=0, duration_ms=1, stdout="", stderr=""),
+            CmdResult(
+                argv=["openclaw", "gateway", "status", "--json", "--require-rpc"],
+                cwd=None,
+                exit_code=1,
+                duration_ms=1,
+                stdout='{"rpc":{"ok":false}}',
+                stderr="rpc unavailable",
+            ),
+        ]
+
+        with patch("fix_my_claw.core.run_cmd", side_effect=responses):
+            probe = _probe_ai_provider(cfg, "openclaw")
+
+        self.assertFalse(probe.available)
+        self.assertEqual(probe.reason, "gateway-rpc-unavailable")
 
 
 class GatewayModeGuardTests(unittest.TestCase):

@@ -116,8 +116,10 @@ Key settings:
 | `[openclaw].allow_remote_mode` | Allow running even when OpenClaw is configured with `gateway.mode=remote` |
 | `[repair].official_steps` | The ordered recovery commands to run before AI escalation |
 | `[ai].enabled` | Whether AI-assisted remediation is allowed |
-| `[ai].provider` | `auto`, `codex`, or `openclaw`; `auto` probes both locally before fallback |
+| `[ai].backend` | `direct` or `acpx`; direct keeps native CLIs, acpx routes through the ACP client layer |
+| `[ai].provider` | `auto`, `codex`, `claude`, or `openclaw`; the candidate order depends on the backend |
 | `[ai].local` | When using `provider = "openclaw"`, bypass the Gateway with `openclaw agent --local` |
+| `[ai].acpx_permissions` | Permission mode used for `acpx` runs, typically `approve-all` for unattended fixes |
 | `[ai].allow_code_changes` | Whether a second-stage Codex run may make broader code or installation changes |
 
 The default config stores all state under `~/.fix-my-claw`, so the tool remains self-contained and easy to inspect.
@@ -151,35 +153,54 @@ Notes for systemd hosts:
 
 AI-assisted remediation is enabled in the default config.
 
-When `provider = "auto"`:
+There are now 2 AI backends:
+
+- `backend = "direct"`: current native integrations such as `codex exec` and `openclaw agent`
+- `backend = "acpx"`: route supported coding agents through [`acpx`](https://github.com/openclaw/acpx), the ACP client/orchestrator layer
+
+When `backend = "direct"` and `provider = "auto"`:
 
 - `fix-my-claw` probes local `codex` and `openclaw` availability before AI fallback
 - Current order is `codex` first, then `openclaw`
 - `codex` is checked via CLI availability, while `openclaw` is checked via `openclaw models status --check --json`
 - If the first provider is unusable or the repair run fails to recover OpenClaw, the next usable provider is tried automatically
 
-When `provider = "codex"`:
+When `backend = "acpx"` and `provider = "auto"`:
+
+- `fix-my-claw` probes `codex` first, then `claude`
+- `acpx openclaw` is supported, but it is intentionally not part of the default `auto` order because `openclaw acp` is backed by the Gateway
+- This makes `acpx` a good unified interface for Codex/Claude-style coding agents, but not the right default path for Gateway-down OpenClaw recovery
+
+When using the direct backend with `provider = "codex"`:
 
 - The first stage runs `codex exec` in `workspace-write` mode with explicitly added directories
 - The second stage is still disabled unless `ai.allow_code_changes = true`
 - Daily attempt limits and cooldowns reduce the chance of repeated AI runs on the same host
 
-When `provider = "openclaw"`:
+When using the direct backend with `provider = "openclaw"`:
 
 - `fix-my-claw` runs `openclaw agent`
 - Set `local = true` to bypass the Gateway and use the embedded agent path directly
 - This is the path to use when the Gateway is already down but the host still has working OpenClaw model/provider credentials
 - If `provider` is explicitly pinned to `openclaw`, `codex` is still kept as the next provider-level fallback
 
+When using the `acpx` backend:
+
+- `fix-my-claw` runs one-shot `acpx <provider> exec --file -` calls
+- The default `acpx` mode is non-interactive and auto-approved for unattended fixes
+- `acpx` itself is still alpha, so pinning the binary/version is safer for production automation
+
 Example:
 
 ```toml
 [ai]
 enabled = true
+backend = "acpx"
 provider = "auto"
-command = "codex"
-agent_id = "main"
-local = true
+acpx_command = "acpx"
+acpx_permissions = "approve-all"
+acpx_non_interactive_permissions = "fail"
+acpx_format = "json"
 timeout_seconds = 1800
 ```
 
@@ -191,6 +212,7 @@ If you want official repair steps only, set `[ai].enabled = false`.
 - If you only need a periodic check, the timer-based deployment may be a better fit than a full monitor loop
 - The tool assumes it can read the relevant OpenClaw workspace and state directories
 - Using OpenClaw-registered models during a Gateway outage is possible only through a local/embedded path such as `openclaw agent --local` or another direct provider path; the normal Gateway routing path is unavailable while the Gateway is down
+- `acpx` is promising as a unified coding-agent interface, but it is still alpha and its `openclaw` target is Gateway-backed
 
 ## Documentation
 

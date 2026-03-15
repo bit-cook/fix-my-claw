@@ -31,6 +31,9 @@ post_step_wait_seconds = 2
 [ai]
 # AI-assisted remediation is enabled by default; disable it only if you want official repair steps only.
 enabled = true
+# `direct` keeps the current native integrations (`codex exec`, `openclaw agent`).
+# `acpx` routes supported coding agents through the ACP client interface.
+backend = "direct"
 provider = "auto"
 command = "codex"
 # For provider = "openclaw", fix-my-claw will call `openclaw agent`.
@@ -38,6 +41,12 @@ command = "codex"
 agent_id = "main"
 local = false
 agent_args = []
+# acpx backend settings (used only when backend = "acpx")
+acpx_command = "acpx"
+acpx_args = []
+acpx_permissions = "approve-all"
+acpx_non_interactive_permissions = "fail"
+acpx_format = "json"
 # Stage 1: allow ONLY workspace + openclaw state dir + fix-my-claw dir (workspace-write sandbox).
 args = [
   "exec",
