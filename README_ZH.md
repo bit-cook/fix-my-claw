@@ -1,90 +1,137 @@
-# 🦀 fix-my-claw
+# fix-my-claw
 
 [English](README.md)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](#前置条件)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#环境要求)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
 
-一个开箱即用的 OpenClaw 守护与自动恢复工具，让服务自己保持健康。
+让 OpenClaw 在无人值守时也能保持健康。
 
-复制这段指令给你的openclaw来启用fix-my-claw：
+`fix-my-claw` 是一个面向 OpenClaw 主机的小型守护与自愈工具。它会探测 gateway 的健康状态，按你定义的官方修复步骤执行恢复，并为每次失败修复保留一个带时间戳的现场目录。如果你现在已经在手工执行 `openclaw doctor --repair --non-interactive` 和 `openclaw gateway restart`，`fix-my-claw` 会把这套流程变成带冷却、锁和可选 AI 升级修复的守护循环。
 
-```安装https://github.com/caopulan/fix-my-claw，使用nohup执行fix-my-claw up```
+[功能](#功能) • [安装](#安装) • [快速开始](#快速开始) • [配置](#配置) • [Systemd 部署](#systemd-部署) • [文档](#文档)
 
-## ✨ 效果与亮点
+```mermaid
+flowchart LR
+  A["探测 gateway health 和 status"] --> B{"健康吗？"}
+  B -->|"是"| C["等待下一轮探测"]
+  B -->|"否"| D["执行官方修复步骤"]
+  D --> E{"恢复了吗？"}
+  E -->|"是"| C
+  E -->|"否"| F["可选的 AI 辅助修复"]
+  F --> C
+```
 
-- 🩹 **自动自愈**：检测到异常后自动执行修复步骤。
-- 🧾 **好排障**：每次异常会在 `~/.fix-my-claw/attempts/` 下保存带时间戳的现场产物。
-- 🧯 **默认更稳**：修复冷却、每日次数限制、单实例锁，避免反复抖动。
-- 🧷 **上服务器就能用**：内置 systemd 部署文件。
+## 功能
 
-- 一键启动：`fix-my-claw up`
-- 定时探测：`openclaw gateway health --json` + `openclaw gateway status --json`
-- 优先使用官方修复步骤（默认已内置）
-- 可选：Codex 辅助修复（默认关闭，且默认只允许改配置/workspace）
+- 直接面向 OpenClaw 的 `gateway health` 和 `gateway status` 探测
+- 先走官方修复步骤，再决定是否升级到 AI 修复
+- 每次修复都在 `~/.fix-my-claw/attempts/<timestamp>/` 下保留现场
+- 内置冷却、过期锁清理和单实例保护，避免抖动
+- AI 辅助修复默认关闭，权限边界保守
+- 自带 systemd 服务与定时器部署文件
 
-## 🚀 快速开始
+## 安装
+
+`fix-my-claw` 是一个 Python CLI 工具。最直接的安装方式是从 GitHub 安装：
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install .
+pip install git+https://github.com/caopulan/fix-my-claw.git
+```
 
+如果你已经把仓库拉到本地：
+
+```bash
+pip install .
+```
+
+## 环境要求
+
+- Python 3.9+
+- 已安装 OpenClaw，且可以通过 `openclaw` 调用
+- 运行机器能访问 OpenClaw 的 state 目录和 workspace 目录
+- 最好直接部署在 Gateway 所在主机上；如果你的 OpenClaw 使用 `gateway.mode=remote`，CLI 探测目标可能是远端，但本地文件修复仍发生在当前机器，需要额外确认
+
+如果 `openclaw` 不在 `PATH` 中，请在配置里把 `[openclaw].command` 改成绝对路径。
+
+## 快速开始
+
+用默认设置启动守护：
+
+```bash
 fix-my-claw up
 ```
 
+这个命令会在缺少配置时自动生成默认配置，然后启动常驻监控循环。
+
 默认路径：
 
-- 配置：`~/.fix-my-claw/config.toml`（`fix-my-claw up` 会自动生成）
-- 日志：`~/.fix-my-claw/fix-my-claw.log`
-- 产物：`~/.fix-my-claw/attempts/<timestamp>/`
+- 配置文件：`~/.fix-my-claw/config.toml`
+- 日志文件：`~/.fix-my-claw/fix-my-claw.log`
+- 修复现场：`~/.fix-my-claw/attempts/<timestamp>/`
 
-## ✅ 前置条件
-
-- Python 3.9+
-- 已安装 OpenClaw，并且 `openclaw` 可在 `PATH` 中直接调用
-
-## 🧰 常用命令
+常用单次命令：
 
 ```bash
-fix-my-claw up      # 自动生成默认配置（如不存在）+ 启动常驻监控
-fix-my-claw check   # 单次探测
-fix-my-claw repair  # 单次修复尝试
-fix-my-claw monitor # 常驻循环（要求配置已存在）
-fix-my-claw init    # 生成默认配置
+# 生成默认配置并打印路径
+fix-my-claw init
+
+# 单次探测，并输出机器可读 JSON
+fix-my-claw check --json
+
+# 忽略冷却限制，强制执行一次修复
+fix-my-claw repair --force --json
+
+# 使用自定义配置文件运行
+fix-my-claw monitor --config /etc/fix-my-claw/config.toml
 ```
 
-## 🧭 工作原理（概览）
+## 与 OpenClaw 的集成方式
 
-```mermaid
-flowchart TD
-  A["定时器 / 常驻循环"] --> B["health 探测"]
-  B --> C["status 探测"]
-  C -->|健康| D["sleep"]
-  C -->|不健康| E["官方修复步骤"]
-  E --> F{"恢复了吗？"}
-  F -->|是| D
-  F -->|否| G["Codex 辅助修复（可选）"]
-  G --> D
-```
+默认情况下，`fix-my-claw` 使用的就是运维人员平时手工执行的 OpenClaw 命令：
 
-## ⚙️ 配置
+- 健康探测：`openclaw gateway health --json`
+- 状态探测：`openclaw gateway status --json --require-rpc`
+- 日志抓取：`openclaw logs --tail 200`
+- 官方修复步骤：
+  - `openclaw doctor --repair --non-interactive`
+  - `openclaw gateway restart`
 
-所有设置都在一个 TOML 文件里：
+这些命令路径、探测参数和修复步骤都可以在配置文件里覆盖。
 
-- 默认：`~/.fix-my-claw/config.toml`
-- 示例：`examples/fix-my-claw.toml`
+## 配置
 
-提示：如果 systemd 环境下找不到 `openclaw`，请把 `[openclaw].command` 配成绝对路径。
+所有运行时设置都集中在一个 TOML 文件里。你可以先执行 `fix-my-claw init` 生成默认配置，或者直接参考 [examples/fix-my-claw.toml](examples/fix-my-claw.toml)。
 
-## 🖥️ 服务器部署（systemd）
+关键配置项：
 
-`deploy/systemd/` 提供两种方式：
+| 配置项 | 作用 |
+| --- | --- |
+| `[monitor].interval_seconds` | 守护循环的探测间隔 |
+| `[monitor].repair_cooldown_seconds` | 两次修复之间的最小间隔 |
+| `[openclaw].command` | systemd 环境下 `PATH` 不一致时指定 `openclaw` 绝对路径 |
+| `[openclaw].allow_remote_mode` | 是否允许在 `gateway.mode=remote` 时继续运行 |
+| `[repair].official_steps` | 进入 AI 修复前的官方修复命令序列 |
+| `[ai].enabled` | 是否允许 AI 辅助修复 |
+| `[ai].provider` | `auto`、`codex` 或 `openclaw`；`auto` 会先本地探测这两条路 |
+| `[ai].local` | 当 `provider = "openclaw"` 时，是否使用 `openclaw agent --local` 直接绕过 Gateway |
+| `[ai].allow_code_changes` | 是否允许第二阶段进行更宽松的代码或安装修改 |
 
-- **方式 A（推荐）**：`fix-my-claw.service` 常驻监控
-- **方式 B**：`fix-my-claw-oneshot.service` + `fix-my-claw.timer` 定时执行 `fix-my-claw repair`
+默认配置会把状态、日志和修复现场都放在 `~/.fix-my-claw` 下，便于排查和清理。
 
-示例（方式 A）：
+默认情况下，只要 `openclaw config get gateway.mode --json` 返回 `"remote"`，`fix-my-claw` 就会拒绝运行。这样可以避免最危险的错配场景：探测的是远端 Gateway，但本地修复步骤改的却是当前机器。只有在你明确知道自己在做什么时，才应手动设置 `[openclaw].allow_remote_mode = true`。
+
+## Systemd 部署
+
+Linux 部署文件位于 [deploy/systemd](deploy/systemd)：
+
+- `fix-my-claw.service`：推荐，常驻监控循环
+- `fix-my-claw-oneshot.service` + `fix-my-claw.timer`：按周期执行修复
+
+使用常驻服务的示例：
 
 ```bash
 sudo mkdir -p /etc/fix-my-claw
@@ -95,27 +142,78 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fix-my-claw.service
 ```
 
-## 🧩 Codex 辅助修复（可选）
+systemd 主机上的注意事项：
 
-开启后会使用 Codex CLI 全程无确认执行。
+- 示例 unit 使用的是 `/usr/bin/env fix-my-claw ...`。如果你把它装在虚拟环境里，请把 `ExecStart` 改成虚拟环境里 `fix-my-claw` 的绝对路径。
+- 如果 systemd 环境里找不到 `openclaw`，请把 `[openclaw].command` 配成绝对路径。
 
-- 默认配置使用 `codex exec` + `approval_policy="never"`
-- 第一阶段默认仅允许写：OpenClaw 配置/状态目录、workspace、以及 fix-my-claw 自己的 state 目录
-- 第二阶段默认关闭（`ai.allow_code_changes=false`）
+## 可选的 AI 辅助修复
 
-## 🩺 常见问题
+AI 辅助修复默认关闭。
 
-- 提示 `command not found: openclaw`
-  - 确保已安装 OpenClaw，且 `openclaw` 在 `PATH` 中（systemd 环境下尤其常见）。
-  - 或将 `[openclaw].command` 配成绝对路径。
-- 提示 `another fix-my-claw instance is running`
-  - 通过 `[monitor].state_dir` 下的 lock 文件避免并发修复互相影响。
-  - 如怀疑 lock 残留，请先确认没有实例运行，再删除 lock 文件。
+当 `provider = "auto"` 时：
 
-## 🤝 参与贡献
+- `fix-my-claw` 会先本地探测 `codex` 和 `openclaw` 这两条 AI 修复路径是否可用
+- 当前顺序是先 `codex`，再 `openclaw`
+- `codex` 通过 CLI 可执行性做快速检查，`openclaw` 通过 `openclaw models status --check --json` 做本地可用性检查
+- 如果前一个 provider 不可用，或执行后仍未修好，就会自动尝试下一个可用 provider
 
-见 `CONTRIBUTING.md`、`CODE_OF_CONDUCT.md` 与 `SECURITY.md`。
+当 `provider = "codex"` 时：
 
-## 📄 开源协议
+- 第一阶段会以 `workspace-write` 模式运行 `codex exec`，并只附加明确允许的目录
+- 第二阶段依旧默认关闭，只有 `ai.allow_code_changes = true` 才会放开
+- 每日次数限制和冷却时间会降低同一主机反复触发 AI 修复的概率
 
-MIT License，见 `LICENSE`。
+当 `provider = "openclaw"` 时：
+
+- `fix-my-claw` 会执行 `openclaw agent`
+- 如果 Gateway 本身已经不健康，建议把 `local = true` 打开，直接走嵌入式 agent 路径
+- 这也是“Gateway 已宕机，但仍希望借 OpenClaw 已注册模型继续修复”的主要方式
+- 如果你显式固定 `provider = "openclaw"`，`codex` 仍会作为下一层 provider 级兜底
+
+示例：
+
+```toml
+[ai]
+enabled = true
+provider = "auto"
+command = "codex"
+agent_id = "main"
+local = true
+timeout_seconds = 1800
+```
+
+这个模式适合你明确接受无人确认修复的机器。
+
+## 取舍与边界
+
+- `fix-my-claw` 负责自动恢复，不替代你去修掉 OpenClaw 或宿主机上的根因问题
+- 如果你只需要定时检查，timer 方式可能比常驻监控更合适
+- 工具默认假设自己能读取 OpenClaw 的 workspace 和 state 目录
+- 如果 Gateway 已宕机，仍想使用 OpenClaw 已注册模型，必须走本地/嵌入式执行路径，例如 `openclaw agent --local`，或者直接走 provider 直连；常规 Gateway 路由在 Gateway 宕机时不可用
+
+## 文档
+
+- [示例配置](examples/fix-my-claw.toml)
+- [systemd 部署文件](deploy/systemd)
+- [更新日志](CHANGELOG.md)
+- [贡献指南](CONTRIBUTING.md)
+- [行为准则](CODE_OF_CONDUCT.md)
+- [安全策略](SECURITY.md)
+- [Issue 列表](https://github.com/caopulan/fix-my-claw/issues)
+
+## 参与贡献
+
+欢迎提交贡献。发起 PR 前先看 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+提交 bug 时，建议附带：
+
+- 你的操作系统和 Python 版本
+- 你的 OpenClaw 版本
+- 相关的 `fix-my-claw` 配置，敏感信息请先脱敏
+- 最近的 `~/.fix-my-claw/fix-my-claw.log`
+- 最新一次 `~/.fix-my-claw/attempts/` 下的现场目录
+
+## 开源协议
+
+[MIT](LICENSE) © fix-my-claw contributors

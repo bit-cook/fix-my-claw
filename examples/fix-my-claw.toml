@@ -10,27 +10,34 @@ log_level = "INFO"
 command = "openclaw"
 state_dir = "~/.openclaw"
 workspace_dir = "~/.openclaw/workspace"
+# Default safety guard: refuse to run if OpenClaw is configured with gateway.mode=remote.
+allow_remote_mode = false
 health_args = ["gateway", "health", "--json"]
-status_args = ["gateway", "status", "--json"]
+status_args = ["gateway", "status", "--json", "--require-rpc"]
 logs_args = ["logs", "--tail", "200"]
 
 [repair]
 enabled = true
 # Default official steps:
-# 1) `openclaw doctor --repair` (fixes common config/workspace issues)
+# 1) `openclaw doctor --repair --non-interactive` (safer for unattended runs)
 # 2) `openclaw gateway restart` (restart supervised gateway service)
 official_steps = [
-  ["openclaw", "doctor", "--repair"],
+  ["openclaw", "doctor", "--repair", "--non-interactive"],
   ["openclaw", "gateway", "restart"],
 ]
 step_timeout_seconds = 600
 post_step_wait_seconds = 2
 
 [ai]
-# Codex-assisted remediation is powerful and risky; enable only if you accept unattended execution.
+# AI-assisted remediation is powerful and risky; enable only if you accept unattended execution.
 enabled = false
-provider = "codex"
+provider = "auto"
 command = "codex"
+# For provider = "openclaw", fix-my-claw will call `openclaw agent`.
+# `local = true` bypasses the Gateway and is the safer choice when the Gateway itself is unhealthy.
+agent_id = "main"
+local = false
+agent_args = []
 # Stage 1: allow ONLY workspace + openclaw state dir + fix-my-claw dir (workspace-write sandbox).
 args = [
   "exec",

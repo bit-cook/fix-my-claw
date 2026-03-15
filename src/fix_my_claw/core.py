@@ -36,14 +36,15 @@ log_level = "INFO"
 command = "openclaw"
 state_dir = "~/.openclaw"
 workspace_dir = "~/.openclaw/workspace"
+allow_remote_mode = false
 health_args = ["gateway", "health", "--json"]
-status_args = ["gateway", "status", "--json"]
+status_args = ["gateway", "status", "--json", "--require-rpc"]
 logs_args = ["logs", "--tail", "200"]
 
 [repair]
 enabled = true
 official_steps = [
-  ["openclaw", "doctor", "--repair"],
+  ["openclaw", "doctor", "--repair", "--non-interactive"],
   ["openclaw", "gateway", "restart"],
 ]
 step_timeout_seconds = 600
@@ -51,8 +52,11 @@ post_step_wait_seconds = 2
 
 [ai]
 enabled = false
-provider = "codex"
+provider = "auto"
 command = "codex"
+agent_id = "main"
+local = false
+agent_args = []
 args = [
   "exec",
   "-s", "workspace-write",
@@ -113,6 +117,77 @@ def redact_text(text: str) -> str:
     return out
 
 
+def _supports_color(stream: Any) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)()) and os.environ.get("TERM") not in {"", "dumb", None}
+
+
+def _format_duration_ms(duration_ms: int) -> str:
+    if duration_ms < 1000:
+        return f"{duration_ms}ms"
+    seconds = duration_ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - (minutes * 60)
+    return f"{minutes}m{rem:04.1f}s"
+
+
+def _format_argv(argv: list[str], *, limit: int = 120) -> str:
+    rendered = " ".join(argv)
+    return rendered if len(rendered) <= limit else f"{rendered[: limit - 3]}..."
+
+
+class ConsoleFormatter(logging.Formatter):
+    _RESET = "\033[0m"
+    _DIM = "\033[2m"
+    _COLORS = {
+        "START": "\033[94m",
+        "WATCH": "\033[96m",
+        "PROBE": "\033[92m",
+        "REPAIR": "\033[93m",
+        "AI": "\033[95m",
+        "ERROR": "\033[91m",
+    }
+
+    def __init__(self, *, use_color: bool):
+        super().__init__(datefmt="%H:%M:%S")
+        self.use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = self.formatTime(record, "%H:%M:%S")
+        lane = self._lane(record)
+        message = record.getMessage()
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+
+        ts_text = self._decorate(ts, self._DIM)
+        lane_text = self._decorate(lane.ljust(6), self._COLORS.get(lane, ""))
+        return f"{ts_text} | {lane_text} | {message}"
+
+    def _lane(self, record: logging.LogRecord) -> str:
+        name = record.name
+        if record.levelno >= logging.ERROR:
+            return "ERROR"
+        if "startup" in name:
+            return "START"
+        if "watchdog" in name:
+            return "WATCH"
+        if ".openclaw" in name:
+            return "PROBE"
+        if ".ai" in name:
+            return "AI"
+        if ".repair" in name:
+            return "REPAIR"
+        return "LOG"
+
+    def _decorate(self, text: str, prefix: str) -> str:
+        if not self.use_color or not prefix:
+            return text
+        return f"{prefix}{text}{self._RESET}"
+
+
 def setup_logging(cfg: "AppConfig") -> None:
     ensure_dir(cfg.monitor.state_dir)
     ensure_dir(cfg.monitor.log_file.parent)
@@ -137,7 +212,7 @@ def setup_logging(cfg: "AppConfig") -> None:
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(level)
-    stream_handler.setFormatter(fmt)
+    stream_handler.setFormatter(ConsoleFormatter(use_color=_supports_color(stream_handler.stream)))
 
     root.handlers.clear()
     root.addHandler(file_handler)
@@ -159,8 +234,11 @@ class OpenClawConfig:
     command: str = "openclaw"
     state_dir: Path = field(default_factory=lambda: _as_path("~/.openclaw"))
     workspace_dir: Path = field(default_factory=lambda: _as_path("~/.openclaw/workspace"))
+    allow_remote_mode: bool = False
     health_args: list[str] = field(default_factory=lambda: ["gateway", "health", "--json"])
-    status_args: list[str] = field(default_factory=lambda: ["gateway", "status", "--json"])
+    status_args: list[str] = field(
+        default_factory=lambda: ["gateway", "status", "--json", "--require-rpc"]
+    )
     logs_args: list[str] = field(default_factory=lambda: ["logs", "--tail", "200"])
 
 
@@ -169,7 +247,7 @@ class RepairConfig:
     enabled: bool = True
     official_steps: list[list[str]] = field(
         default_factory=lambda: [
-            ["openclaw", "doctor", "--repair"],
+            ["openclaw", "doctor", "--repair", "--non-interactive"],
             ["openclaw", "gateway", "restart"],
         ]
     )
@@ -180,8 +258,11 @@ class RepairConfig:
 @dataclass(frozen=True)
 class AiConfig:
     enabled: bool = False
-    provider: str = "codex"  # optional/for humans; command+args are what we actually execute
+    provider: str = "auto"  # auto | codex | openclaw
     command: str = "codex"
+    agent_id: str | None = "main"
+    local: bool = False
+    agent_args: list[str] = field(default_factory=list)
     # args supports placeholders: $workspace_dir, $openclaw_state_dir, $monitor_state_dir
     args: list[str] = field(
         default_factory=lambda: [
@@ -247,8 +328,9 @@ def _parse_openclaw(raw: dict[str, Any]) -> OpenClawConfig:
         command=str(_get(raw, "command", "openclaw")),
         state_dir=_as_path(str(_get(raw, "state_dir", "~/.openclaw"))),
         workspace_dir=_as_path(str(_get(raw, "workspace_dir", "~/.openclaw/workspace"))),
+        allow_remote_mode=bool(_get(raw, "allow_remote_mode", False)),
         health_args=list(_get(raw, "health_args", ["gateway", "health", "--json"])),
-        status_args=list(_get(raw, "status_args", ["gateway", "status", "--json"])),
+        status_args=list(_get(raw, "status_args", ["gateway", "status", "--json", "--require-rpc"])),
         logs_args=list(_get(raw, "logs_args", ["logs", "--tail", "200"])),
     )
 
@@ -268,6 +350,9 @@ def _parse_ai(raw: dict[str, Any]) -> AiConfig:
         enabled=bool(_get(raw, "enabled", cfg.enabled)),
         provider=str(_get(raw, "provider", cfg.provider)),
         command=str(_get(raw, "command", cfg.command)),
+        agent_id=_get(raw, "agent_id", cfg.agent_id),
+        local=bool(_get(raw, "local", cfg.local)),
+        agent_args=list(_get(raw, "agent_args", cfg.agent_args)),
         args=list(_get(raw, "args", cfg.args)),
         model=_get(raw, "model", cfg.model),
         timeout_seconds=int(_get(raw, "timeout_seconds", cfg.timeout_seconds)),
@@ -313,6 +398,32 @@ class CmdResult:
         return self.exit_code == 0
 
 
+class UnsupportedOpenClawModeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class AiProviderProbe:
+    provider: str
+    available: bool
+    reason: str
+    argv: list[str]
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    def to_json(self) -> dict:
+        return {
+            "provider": self.provider,
+            "available": self.available,
+            "reason": self.reason,
+            "argv": self.argv,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
 def run_cmd(
     argv: list[str],
     *,
@@ -356,6 +467,71 @@ def run_cmd(
         duration_ms=duration_ms,
         stdout=out,
         stderr=err,
+    )
+
+
+def _openclaw_cwd(cfg: "AppConfig") -> Path | None:
+    return cfg.openclaw.workspace_dir if cfg.openclaw.workspace_dir.exists() else None
+
+
+def _run_openclaw_config_cmd(cfg: "AppConfig", args: list[str]) -> CmdResult:
+    argv = [cfg.openclaw.command, "config", *args]
+    return run_cmd(argv, timeout_seconds=cfg.monitor.probe_timeout_seconds, cwd=_openclaw_cwd(cfg))
+
+
+def _parse_json_scalar(stdout: str) -> Any | None:
+    s = stdout.strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return None
+
+
+def _last_nonempty_line(text: str) -> str | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def _ensure_supported_gateway_mode(cfg: "AppConfig") -> None:
+    if cfg.openclaw.allow_remote_mode:
+        return
+
+    mode_res = _run_openclaw_config_cmd(cfg, ["get", "gateway.mode", "--json"])
+    if not mode_res.ok:
+        return
+
+    mode = _parse_json_scalar(mode_res.stdout)
+    if mode != "remote":
+        return
+
+    config_res = _run_openclaw_config_cmd(cfg, ["file"])
+    config_path = _last_nonempty_line(config_res.stdout) if config_res.ok else None
+    path_hint = f" active config: {config_path}." if config_path else ""
+    raise UnsupportedOpenClawModeError(
+        "fix-my-claw refuses to run when OpenClaw has gateway.mode=remote because probes may target "
+        "a remote Gateway while repairs still modify this machine."
+        f"{path_hint} Deploy fix-my-claw on the Gateway host, or set [openclaw].allow_remote_mode = true "
+        "if you explicitly want this risk."
+    )
+
+
+def _log_startup(cfg: "AppConfig", *, mode: str, config_path: str) -> None:
+    startup_log = logging.getLogger("fix_my_claw.startup")
+    startup_log.info(
+        "mode=%s config=%s",
+        mode,
+        _as_path(config_path),
+    )
+    startup_log.info(
+        "openclaw=%s workspace=%s interval=%ss cooldown=%ss ai=%s/%s",
+        cfg.openclaw.command,
+        cfg.openclaw.workspace_dir,
+        cfg.monitor.interval_seconds,
+        cfg.monitor.repair_cooldown_seconds,
+        "on" if cfg.ai.enabled else "off",
+        cfg.ai.provider,
     )
 
 
@@ -522,10 +698,11 @@ class Probe:
     name: str
     cmd: CmdResult
     json_data: dict | list | None
+    effective_ok: bool
 
     @property
     def ok(self) -> bool:
-        return self.cmd.ok
+        return self.effective_ok
 
     def to_json(self) -> dict:
         return {
@@ -550,16 +727,59 @@ def _parse_json_maybe(stdout: str) -> dict | list | None:
         return None
 
 
+def _probe_effective_ok(name: str, cmd: CmdResult, data: dict | list | None) -> bool:
+    if not cmd.ok:
+        return False
+    if not isinstance(data, dict):
+        return True
+
+    if name == "health":
+        ok = data.get("ok")
+        if isinstance(ok, bool):
+            return ok
+        healthy = data.get("healthy")
+        if isinstance(healthy, bool):
+            return healthy
+        nested_health = data.get("health")
+        if isinstance(nested_health, dict):
+            nested_healthy = nested_health.get("healthy")
+            if isinstance(nested_healthy, bool):
+                return nested_healthy
+        return True
+
+    if name == "status":
+        rpc = data.get("rpc")
+        if isinstance(rpc, dict):
+            rpc_ok = rpc.get("ok")
+            if isinstance(rpc_ok, bool) and not rpc_ok:
+                return False
+        nested_health = data.get("health")
+        if isinstance(nested_health, dict):
+            nested_healthy = nested_health.get("healthy")
+            if isinstance(nested_healthy, bool):
+                return nested_healthy
+        healthy = data.get("healthy")
+        if isinstance(healthy, bool):
+            return healthy
+        ok = data.get("ok")
+        if isinstance(ok, bool):
+            return ok
+        return True
+
+    return True
+
+
 def probe_health(cfg: AppConfig, *, log_on_fail: bool = True) -> Probe:
     argv = [cfg.openclaw.command, *cfg.openclaw.health_args]
     cwd = cfg.openclaw.workspace_dir if cfg.openclaw.workspace_dir.exists() else None
     cmd = run_cmd(argv, timeout_seconds=cfg.monitor.probe_timeout_seconds, cwd=cwd)
     data = _parse_json_maybe(cmd.stdout)
-    if log_on_fail and not cmd.ok:
+    effective_ok = _probe_effective_ok("health", cmd, data)
+    if log_on_fail and not effective_ok:
         logging.getLogger("fix_my_claw.openclaw").warning(
             "health probe failed: %s", truncate_for_log(cmd.stderr or cmd.stdout)
         )
-    return Probe(name="health", cmd=cmd, json_data=data)
+    return Probe(name="health", cmd=cmd, json_data=data, effective_ok=effective_ok)
 
 
 def probe_status(cfg: AppConfig, *, log_on_fail: bool = True) -> Probe:
@@ -567,11 +787,12 @@ def probe_status(cfg: AppConfig, *, log_on_fail: bool = True) -> Probe:
     cwd = cfg.openclaw.workspace_dir if cfg.openclaw.workspace_dir.exists() else None
     cmd = run_cmd(argv, timeout_seconds=cfg.monitor.probe_timeout_seconds, cwd=cwd)
     data = _parse_json_maybe(cmd.stdout)
-    if log_on_fail and not cmd.ok:
+    effective_ok = _probe_effective_ok("status", cmd, data)
+    if log_on_fail and not effective_ok:
         logging.getLogger("fix_my_claw.openclaw").warning(
             "status probe failed: %s", truncate_for_log(cmd.stderr or cmd.stdout)
         )
-    return Probe(name="status", cmd=cmd, json_data=data)
+    return Probe(name="status", cmd=cmd, json_data=data, effective_ok=effective_ok)
 
 
 def probe_logs(cfg: AppConfig, *, timeout_seconds: int = 15) -> CmdResult:
@@ -663,18 +884,18 @@ def _run_official_steps(cfg: AppConfig, attempt_dir: Path) -> list[dict]:
     total = len(cfg.repair.official_steps)
     for idx, step in enumerate(cfg.repair.official_steps, start=1):
         argv = [cfg.openclaw.command if step and step[0] == "openclaw" else step[0], *step[1:]]
-        repair_log.warning("official step %d/%d: %s", idx, total, " ".join(argv))
+        repair_log.warning("official %d/%d run=%s", idx, total, _format_argv(argv))
         cwd = cfg.openclaw.workspace_dir if cfg.openclaw.workspace_dir.exists() else None
         res = run_cmd(argv, timeout_seconds=cfg.repair.step_timeout_seconds, cwd=cwd)
         repair_log.warning(
-            "official step %d/%d done: exit=%s duration_ms=%s",
+            "official %d/%d exit=%s duration=%s",
             idx,
             total,
             res.exit_code,
-            res.duration_ms,
+            _format_duration_ms(res.duration_ms),
         )
         if res.stderr:
-            repair_log.info("official step %d/%d stderr: %s", idx, total, truncate_for_log(res.stderr))
+            repair_log.info("official %d/%d stderr=%s", idx, total, truncate_for_log(res.stderr))
         _write_attempt_file(attempt_dir, f"official.{idx}.stdout.txt", redact_text(res.stdout))
         _write_attempt_file(attempt_dir, f"official.{idx}.stderr.txt", redact_text(res.stderr))
         results.append(
@@ -688,7 +909,7 @@ def _run_official_steps(cfg: AppConfig, attempt_dir: Path) -> list[dict]:
         )
         time.sleep(cfg.repair.post_step_wait_seconds)
         if _probe_is_healthy(cfg):
-            repair_log.warning("OpenClaw is healthy after official step %d/%d", idx, total)
+            repair_log.warning("official %d/%d restored health", idx, total)
             break
     return results
 
@@ -714,7 +935,128 @@ def _build_ai_cmd(cfg: AppConfig, *, code_stage: bool) -> list[str]:
     return argv
 
 
-def _run_ai_repair(cfg: AppConfig, attempt_dir: Path, *, code_stage: bool) -> CmdResult:
+def _normalize_ai_provider(provider: str) -> str:
+    return provider.strip().lower().replace("_", "-")
+
+
+def _resolve_codex_ai_command(cfg: AppConfig) -> str:
+    command = cfg.ai.command.strip()
+    return command or "codex"
+
+
+def _resolve_openclaw_ai_command(cfg: AppConfig) -> str:
+    command = cfg.ai.command.strip()
+    if (
+        _normalize_ai_provider(cfg.ai.provider) in {"openclaw", "openclaw-agent"}
+        and command
+        and command != "codex"
+    ):
+        return command
+    if not command or command == "codex":
+        return cfg.openclaw.command
+    return command
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
+    return out
+
+
+def _resolve_ai_provider_candidates(cfg: AppConfig) -> list[str]:
+    provider = _normalize_ai_provider(cfg.ai.provider)
+    if provider in {"", "auto"}:
+        return ["codex", "openclaw"]
+    if provider in {"openclaw", "openclaw-agent"}:
+        return _unique_preserving_order(["openclaw", "codex"])
+    if provider == "codex":
+        return _unique_preserving_order(["codex", "openclaw"])
+    return [provider]
+
+
+def _probe_ai_provider(cfg: AppConfig, provider: str) -> AiProviderProbe:
+    timeout_seconds = min(max(5, cfg.monitor.probe_timeout_seconds), 15)
+    provider = _normalize_ai_provider(provider)
+    cwd = _openclaw_cwd(cfg)
+
+    if provider == "openclaw":
+        argv = [cfg.openclaw.command, "models", "status", "--check", "--json"]
+        cmd = run_cmd(argv, timeout_seconds=timeout_seconds, cwd=cwd)
+        available = cmd.exit_code in {0, 2}
+        reason = "models-status-ok" if cmd.exit_code == 0 else "models-status-expiring-auth" if cmd.exit_code == 2 else "models-status-unavailable"
+        return AiProviderProbe(
+            provider=provider,
+            available=available,
+            reason=reason,
+            argv=argv,
+            exit_code=cmd.exit_code,
+            stdout=cmd.stdout,
+            stderr=cmd.stderr,
+        )
+
+    if provider == "codex":
+        argv = [_resolve_codex_ai_command(cfg), "exec", "--help"]
+        cmd = run_cmd(argv, timeout_seconds=timeout_seconds, cwd=cwd)
+        return AiProviderProbe(
+            provider=provider,
+            available=cmd.ok,
+            reason="command-ok" if cmd.ok else "command-unavailable",
+            argv=argv,
+            exit_code=cmd.exit_code,
+            stdout=cmd.stdout,
+            stderr=cmd.stderr,
+        )
+
+    return AiProviderProbe(
+        provider=provider,
+        available=False,
+        reason="unsupported-provider",
+        argv=[],
+        exit_code=1,
+        stdout="",
+        stderr=f"unsupported AI provider: {provider}",
+    )
+
+
+def _build_ai_invocation(
+    cfg: AppConfig,
+    prompt: str,
+    *,
+    code_stage: bool,
+    provider_override: str | None = None,
+) -> tuple[list[str], str | None]:
+    provider = _normalize_ai_provider(provider_override or cfg.ai.provider)
+    if provider in {"openclaw", "openclaw-agent"}:
+        vars = {
+            "workspace_dir": str(cfg.openclaw.workspace_dir),
+            "openclaw_state_dir": str(cfg.openclaw.state_dir),
+            "monitor_state_dir": str(cfg.monitor.state_dir),
+        }
+        agent_args = [Template(x).safe_substitute(vars) for x in cfg.ai.agent_args]
+        argv = [_resolve_openclaw_ai_command(cfg), "agent", "--json"]
+        if cfg.ai.local:
+            argv.append("--local")
+        agent_id = (cfg.ai.agent_id or "").strip()
+        if agent_id:
+            argv += ["--agent", agent_id]
+        argv += agent_args
+        argv += ["--timeout", str(max(0, cfg.ai.timeout_seconds)), "--message", prompt]
+        return argv, None
+
+    return _build_ai_cmd(cfg, code_stage=code_stage), prompt
+
+
+def _run_ai_repair(
+    cfg: AppConfig,
+    attempt_dir: Path,
+    *,
+    code_stage: bool,
+    provider_override: str | None = None,
+) -> CmdResult:
     prompt_name = "repair_code.md" if code_stage else "repair.md"
     prompt = Template(_load_prompt_text(prompt_name)).safe_substitute(
         {
@@ -728,23 +1070,114 @@ def _run_ai_repair(cfg: AppConfig, attempt_dir: Path, *, code_stage: bool) -> Cm
         }
     )
 
-    argv = _build_ai_cmd(cfg, code_stage=code_stage)
+    provider_name = _normalize_ai_provider(provider_override or cfg.ai.provider)
+    argv, stdin_text = _build_ai_invocation(
+        cfg,
+        prompt,
+        code_stage=code_stage,
+        provider_override=provider_name,
+    )
     logging.getLogger("fix_my_claw.repair").warning(
-        "AI repair (%s) starting: %s", "code" if code_stage else "config", argv
+        "AI %s/%s run=%s",
+        "code" if code_stage else "config",
+        provider_name,
+        _format_argv(argv),
     )
     res = run_cmd(
         argv,
         timeout_seconds=cfg.ai.timeout_seconds,
         cwd=cfg.openclaw.workspace_dir if cfg.openclaw.workspace_dir.exists() else None,
-        stdin_text=prompt,
+        stdin_text=stdin_text,
     )
-    _write_attempt_file(attempt_dir, "ai.argv.txt", " ".join(argv))
-    _write_attempt_file(attempt_dir, "ai.stdout.txt", redact_text(res.stdout))
-    _write_attempt_file(attempt_dir, "ai.stderr.txt", redact_text(res.stderr))
-    logging.getLogger("fix_my_claw.repair").warning("AI repair done: exit=%s", res.exit_code)
+    suffix = provider_name.replace("/", "-")
+    _write_attempt_file(attempt_dir, f"ai.{suffix}.argv.txt", " ".join(argv))
+    _write_attempt_file(attempt_dir, f"ai.{suffix}.stdout.txt", redact_text(res.stdout))
+    _write_attempt_file(attempt_dir, f"ai.{suffix}.stderr.txt", redact_text(res.stderr))
+    logging.getLogger("fix_my_claw.repair").warning(
+        "AI %s/%s exit=%s duration=%s",
+        "code" if code_stage else "config",
+        provider_name,
+        res.exit_code,
+        _format_duration_ms(res.duration_ms),
+    )
     if res.stderr:
-        logging.getLogger("fix_my_claw.repair").warning("AI stderr: %s", truncate_for_log(res.stderr))
+        logging.getLogger("fix_my_claw.repair").warning("AI %s stderr=%s", provider_name, truncate_for_log(res.stderr))
     return res
+
+
+def _attempt_ai_stage(cfg: AppConfig, attempt_dir: Path, *, code_stage: bool) -> tuple[bool, bool, dict]:
+    repair_log = logging.getLogger("fix_my_claw.ai")
+    providers = _resolve_ai_provider_candidates(cfg)
+    probes = [_probe_ai_provider(cfg, provider) for provider in providers]
+    _write_attempt_file(
+        attempt_dir,
+        f"ai.{'code' if code_stage else 'config'}.providers.json",
+        json.dumps([probe.to_json() for probe in probes], ensure_ascii=False, indent=2),
+    )
+
+    stage_details: dict[str, Any] = {
+        "provider_order": providers,
+        "provider_probes": [probe.to_json() for probe in probes],
+        "attempts": [],
+    }
+    used_any = False
+    repair_log.warning(
+        "%s stage providers=%s",
+        "code" if code_stage else "config",
+        ", ".join(
+            f"{probe.provider}:{'ok' if probe.available else 'skip'}"
+            for probe in probes
+        ),
+    )
+
+    for probe in probes:
+        if not probe.available:
+            repair_log.warning(
+                "%s stage skip provider=%s reason=%s",
+                "code" if code_stage else "config",
+                probe.provider,
+                probe.reason,
+            )
+            continue
+
+        used_any = True
+        repair_log.warning(
+            "%s stage try provider=%s reason=%s",
+            "code" if code_stage else "config",
+            probe.provider,
+            probe.reason,
+        )
+        res = _run_ai_repair(
+            cfg,
+            attempt_dir,
+            code_stage=code_stage,
+            provider_override=probe.provider,
+        )
+        context_after = _collect_context(cfg, attempt_dir)
+        fixed = _probe_is_healthy(cfg)
+        stage_details["attempts"].append(
+            {
+                "provider": probe.provider,
+                "reason": probe.reason,
+                "result": res.__dict__,
+                "context_after": context_after,
+                "fixed": fixed,
+            }
+        )
+        if fixed:
+            stage_details["selected_provider"] = probe.provider
+            repair_log.warning(
+                "%s stage restored health via provider=%s",
+                "code" if code_stage else "config",
+                probe.provider,
+            )
+            return used_any, True, stage_details
+
+    if used_any:
+        repair_log.warning("%s stage completed without restoring health", "code" if code_stage else "config")
+    else:
+        repair_log.warning("%s stage had no usable providers", "code" if code_stage else "config")
+    return used_any, False, stage_details
 
 
 def attempt_repair(cfg: AppConfig, store: StateStore, *, force: bool) -> RepairResult:
@@ -772,7 +1205,11 @@ def attempt_repair(cfg: AppConfig, store: StateStore, *, force: bool) -> RepairR
     store.mark_repair_attempt()
     attempt_dir = _attempt_dir(cfg)
     details: dict = {"attempt_dir": str(attempt_dir.resolve())}
-    repair_log.warning("starting repair attempt: dir=%s", attempt_dir.resolve())
+    repair_log.warning(
+        "attempt=%s dir=%s",
+        attempt_dir.name,
+        attempt_dir.resolve(),
+    )
 
     details["context_before"] = _collect_context(cfg, attempt_dir)
     details["official"] = _run_official_steps(cfg, attempt_dir)
@@ -784,30 +1221,37 @@ def attempt_repair(cfg: AppConfig, store: StateStore, *, force: bool) -> RepairR
 
     used_ai = False
     if not cfg.ai.enabled:
-        repair_log.info("Codex-assisted remediation disabled; leaving OpenClaw unhealthy")
+        repair_log.info("AI-assisted remediation disabled; leaving OpenClaw unhealthy")
     elif not store.can_attempt_ai(
         max_attempts_per_day=cfg.ai.max_attempts_per_day,
         cooldown_seconds=cfg.ai.cooldown_seconds,
     ):
-        repair_log.warning("Codex-assisted remediation skipped (rate limit / cooldown)")
+        repair_log.warning("AI-assisted remediation skipped (rate limit / cooldown)")
     else:
         store.mark_ai_attempt()
-        used_ai = True
         details["ai_stage"] = "config"
-        details["ai_result_config"] = _run_ai_repair(cfg, attempt_dir, code_stage=False).__dict__
-        details["context_after_ai_config"] = _collect_context(cfg, attempt_dir)
-        if _probe_is_healthy(cfg):
-            repair_log.warning("recovered by Codex-assisted remediation: dir=%s", attempt_dir.resolve())
+        used_ai, fixed_by_ai, stage_details = _attempt_ai_stage(cfg, attempt_dir, code_stage=False)
+        details["ai_config"] = stage_details
+        if fixed_by_ai:
+            repair_log.warning("recovered by AI-assisted remediation: dir=%s", attempt_dir.resolve())
             return RepairResult(attempted=True, fixed=True, used_ai=True, details=details)
 
-        if cfg.ai.allow_code_changes:
+        if used_ai and cfg.ai.allow_code_changes:
             details["ai_stage"] = "code"
-            details["ai_result_code"] = _run_ai_repair(cfg, attempt_dir, code_stage=True).__dict__
-            details["context_after_ai_code"] = _collect_context(cfg, attempt_dir)
+            used_ai_code, fixed_by_ai_code, stage_details_code = _attempt_ai_stage(
+                cfg,
+                attempt_dir,
+                code_stage=True,
+            )
+            details["ai_code"] = stage_details_code
+            used_ai = used_ai or used_ai_code
+            if fixed_by_ai_code:
+                repair_log.warning("recovered by AI-assisted code remediation: dir=%s", attempt_dir.resolve())
+                return RepairResult(attempted=True, fixed=True, used_ai=True, details=details)
 
     fixed = _probe_is_healthy(cfg)
     repair_log.warning(
-        "repair attempt finished: fixed=%s used_codex=%s dir=%s",
+        "repair attempt finished: fixed=%s used_ai=%s dir=%s",
         fixed,
         used_ai,
         attempt_dir.resolve(),
@@ -817,20 +1261,25 @@ def attempt_repair(cfg: AppConfig, store: StateStore, *, force: bool) -> RepairR
 
 def monitor_loop(cfg: AppConfig, store: StateStore) -> None:
     wd_log = logging.getLogger("fix_my_claw.watchdog")
-    wd_log.info("starting monitor loop: interval=%ss", cfg.monitor.interval_seconds)
+    wd_log.info(
+        "watching every %ss log=%s attempts=%s",
+        cfg.monitor.interval_seconds,
+        cfg.monitor.log_file,
+        cfg.monitor.state_dir / "attempts",
+    )
     while True:
         try:
             result = run_check(cfg, store)
             if not result.healthy:
                 wd_log.warning(
-                    "unhealthy: health_exit=%s status_exit=%s; attempting repair",
+                    "unhealthy health_exit=%s status_exit=%s -> repair",
                     result.health.get("exit_code"),
                     result.status.get("exit_code"),
                 )
                 rr = attempt_repair(cfg, store, force=False)
                 if rr.attempted:
                     wd_log.warning(
-                        "repair finished: fixed=%s used_codex=%s dir=%s",
+                        "repair fixed=%s used_ai=%s dir=%s",
                         rr.fixed,
                         rr.used_ai,
                         rr.details.get("attempt_dir"),
@@ -876,8 +1325,20 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_check(args: argparse.Namespace) -> int:
     cfg = _load_or_init_config(args.config, init_if_missing=False)
     setup_logging(cfg)
+    _log_startup(cfg, mode="check", config_path=args.config)
+    try:
+        _ensure_supported_gateway_mode(cfg)
+    except UnsupportedOpenClawModeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     store = StateStore(cfg.monitor.state_dir)
     result = run_check(cfg, store)
+    logging.getLogger("fix_my_claw.openclaw").info(
+        "check result=%s health_exit=%s status_exit=%s",
+        "healthy" if result.healthy else "unhealthy",
+        result.health.get("exit_code"),
+        result.status.get("exit_code"),
+    )
     if args.json:
         print(json.dumps(result.to_json(), ensure_ascii=False))
     return 0 if result.healthy else 1
@@ -886,6 +1347,12 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_repair(args: argparse.Namespace) -> int:
     cfg = _load_or_init_config(args.config, init_if_missing=False)
     setup_logging(cfg)
+    _log_startup(cfg, mode="repair", config_path=args.config)
+    try:
+        _ensure_supported_gateway_mode(cfg)
+    except UnsupportedOpenClawModeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     lock = FileLock(cfg.monitor.state_dir / "fix-my-claw.lock")
     if not lock.acquire(timeout_seconds=0):
         print("another fix-my-claw instance is running", file=sys.stderr)
@@ -903,6 +1370,12 @@ def cmd_repair(args: argparse.Namespace) -> int:
 def cmd_monitor(args: argparse.Namespace) -> int:
     cfg = _load_or_init_config(args.config, init_if_missing=False)
     setup_logging(cfg)
+    _log_startup(cfg, mode="monitor", config_path=args.config)
+    try:
+        _ensure_supported_gateway_mode(cfg)
+    except UnsupportedOpenClawModeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     lock = FileLock(cfg.monitor.state_dir / "fix-my-claw.lock")
     if not lock.acquire(timeout_seconds=0):
         print("another fix-my-claw instance is running", file=sys.stderr)
@@ -918,6 +1391,12 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 def cmd_up(args: argparse.Namespace) -> int:
     cfg = _load_or_init_config(args.config, init_if_missing=True)
     setup_logging(cfg)
+    _log_startup(cfg, mode="up", config_path=args.config)
+    try:
+        _ensure_supported_gateway_mode(cfg)
+    except UnsupportedOpenClawModeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     lock = FileLock(cfg.monitor.state_dir / "fix-my-claw.lock")
     if not lock.acquire(timeout_seconds=0):
         print("another fix-my-claw instance is running", file=sys.stderr)
