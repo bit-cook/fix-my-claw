@@ -52,7 +52,7 @@ post_step_wait_seconds = 2
 
 [ai]
 enabled = true
-backend = "direct"
+backend = "acpx"
 provider = "auto"
 command = "codex"
 agent_id = "main"
@@ -264,7 +264,7 @@ class RepairConfig:
 @dataclass(frozen=True)
 class AiConfig:
     enabled: bool = True
-    backend: str = "direct"  # direct | acpx
+    backend: str = "acpx"  # direct | acpx
     provider: str = "auto"  # auto | codex | claude | openclaw
     command: str = "codex"
     agent_id: str | None = "main"

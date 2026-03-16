@@ -155,8 +155,15 @@ systemd 主机上的注意事项：
 
 现在有两条 AI backend：
 
-- `backend = "direct"`：继续使用当前原生集成，例如 `codex exec` 和 `openclaw agent`
-- `backend = "acpx"`：通过 [`acpx`](https://github.com/openclaw/acpx) 这层 ACP 客户端/调度接口统一调用 coding agent
+- `backend = "acpx"`：默认统一走 [`acpx`](https://github.com/openclaw/acpx) 这层 ACP 客户端/调度接口
+- `backend = "direct"`：可选的原生集成路径，例如 `codex exec` 和 `openclaw agent`
+
+默认配置下，AI 兜底会以这组设置运行：
+
+- `backend = "acpx"`
+- `provider = "auto"`
+- 当前自动顺序是：`codex`，然后 `claude`
+- `acpx openclaw` 依然支持，但不会进入默认 `auto` 顺序，因为它底层依赖 Gateway-backed 的 `openclaw acp`
 
 当 `backend = "direct"` 且 `provider = "auto"` 时：
 
@@ -169,7 +176,7 @@ systemd 主机上的注意事项：
 
 - `fix-my-claw` 会先探测 `codex`，再探测 `claude`
 - `acpx openclaw` 虽然支持，但不会被放进默认 `auto` 顺序，因为它底层依赖 `openclaw acp`，而后者是 Gateway-backed
-- 所以 `acpx` 很适合作为 Codex/Claude 这类 coding agent 的统一接口层，但不是 Gateway 宕机时 OpenClaw 修复的默认路径
+- 所以 `acpx` 现在就是 Codex/Claude 这类 coding agent 的默认统一接口层，但不是 Gateway 宕机时 OpenClaw 模型修复的默认路径
 
 当使用 direct backend 且 `provider = "codex"` 时：
 

@@ -155,8 +155,15 @@ AI-assisted remediation is enabled in the default config.
 
 There are now 2 AI backends:
 
-- `backend = "direct"`: current native integrations such as `codex exec` and `openclaw agent`
-- `backend = "acpx"`: route supported coding agents through [`acpx`](https://github.com/openclaw/acpx), the ACP client/orchestrator layer
+- `backend = "acpx"`: the default unified path for supported coding agents through [`acpx`](https://github.com/openclaw/acpx)
+- `backend = "direct"`: optional native integrations such as `codex exec` and `openclaw agent`
+
+In the default config, AI fallback runs with:
+
+- `backend = "acpx"`
+- `provider = "auto"`
+- Current automatic order: `codex`, then `claude`
+- `acpx openclaw` remains available when explicitly selected, but it is not part of the default `auto` order because it depends on the Gateway-backed `openclaw acp` path
 
 When `backend = "direct"` and `provider = "auto"`:
 
@@ -169,7 +176,7 @@ When `backend = "acpx"` and `provider = "auto"`:
 
 - `fix-my-claw` probes `codex` first, then `claude`
 - `acpx openclaw` is supported, but it is intentionally not part of the default `auto` order because `openclaw acp` is backed by the Gateway
-- This makes `acpx` a good unified interface for Codex/Claude-style coding agents, but not the right default path for Gateway-down OpenClaw recovery
+- This makes `acpx` the default unified interface for Codex/Claude-style coding agents, but not the default path for Gateway-down OpenClaw model recovery
 
 When using the direct backend with `provider = "codex"`:
 

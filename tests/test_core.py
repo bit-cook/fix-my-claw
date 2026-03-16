@@ -38,10 +38,10 @@ class BuildAiInvocationTests(unittest.TestCase):
         cfg = AiConfig()
 
         self.assertTrue(cfg.enabled)
-        self.assertEqual(cfg.backend, "direct")
+        self.assertEqual(cfg.backend, "acpx")
 
     def test_codex_provider_uses_stdin_prompt(self) -> None:
-        cfg = AppConfig()
+        cfg = AppConfig(ai=AiConfig(backend="direct", provider="codex"))
 
         argv, stdin_text = _build_ai_invocation(cfg, "repair prompt", code_stage=False)
 
@@ -52,7 +52,7 @@ class BuildAiInvocationTests(unittest.TestCase):
         cfg = AppConfig(
             monitor=MonitorConfig(),
             openclaw=OpenClawConfig(command="openclaw"),
-            ai=AiConfig(provider="openclaw", local=True, command="codex", agent_id="main"),
+            ai=AiConfig(backend="direct", provider="openclaw", local=True, command="codex", agent_id="main"),
         )
 
         argv, stdin_text = _build_ai_invocation(cfg, "repair prompt", code_stage=False)
@@ -86,8 +86,13 @@ class BuildAiInvocationTests(unittest.TestCase):
 
 
 class AiProviderSelectionTests(unittest.TestCase):
-    def test_auto_provider_prefers_codex_then_openclaw(self) -> None:
-        cfg = AppConfig(ai=AiConfig(provider="auto"))
+    def test_default_auto_provider_prefers_codex_then_claude(self) -> None:
+        cfg = AppConfig()
+
+        self.assertEqual(_resolve_ai_provider_candidates(cfg), ["codex", "claude"])
+
+    def test_direct_auto_provider_prefers_codex_then_openclaw(self) -> None:
+        cfg = AppConfig(ai=AiConfig(backend="direct", provider="auto"))
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["codex", "openclaw"])
 
     def test_acpx_auto_provider_prefers_codex_then_claude(self) -> None:
@@ -95,7 +100,7 @@ class AiProviderSelectionTests(unittest.TestCase):
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["codex", "claude"])
 
     def test_openclaw_provider_falls_back_to_codex(self) -> None:
-        cfg = AppConfig(ai=AiConfig(provider="openclaw"))
+        cfg = AppConfig(ai=AiConfig(backend="direct", provider="openclaw"))
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["openclaw", "codex"])
 
     def test_acpx_openclaw_provider_falls_back_to_codex_and_claude(self) -> None:
@@ -103,7 +108,7 @@ class AiProviderSelectionTests(unittest.TestCase):
         self.assertEqual(_resolve_ai_provider_candidates(cfg), ["openclaw", "codex", "claude"])
 
     def test_openclaw_probe_treats_expiring_auth_as_available(self) -> None:
-        cfg = AppConfig()
+        cfg = AppConfig(ai=AiConfig(backend="direct"))
         result = CmdResult(
             argv=["openclaw", "models", "status", "--check", "--json"],
             cwd=None,

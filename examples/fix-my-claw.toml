@@ -31,9 +31,9 @@ post_step_wait_seconds = 2
 [ai]
 # AI-assisted remediation is enabled by default; disable it only if you want official repair steps only.
 enabled = true
-# `direct` keeps the current native integrations (`codex exec`, `openclaw agent`).
-# `acpx` routes supported coding agents through the ACP client interface.
-backend = "direct"
+# `acpx` is the default unified interface for supported coding agents such as Codex and Claude.
+# `direct` keeps the native integrations (`codex exec`, `openclaw agent`) as an opt-in fallback path.
+backend = "acpx"
 provider = "auto"
 command = "codex"
 # For provider = "openclaw", fix-my-claw will call `openclaw agent`.
