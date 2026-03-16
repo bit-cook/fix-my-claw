@@ -88,6 +88,12 @@ fix-my-claw init
 # Probe once and print machine-readable JSON
 fix-my-claw check --json
 
+# Dry-run every repair path, including AI backends and configured argv/path checks
+fix-my-claw probe --json
+
+# Skip live AI calls and only validate static prerequisites / dry-run syntax
+fix-my-claw probe --no-live-ai --json
+
 # Force one repair attempt, ignoring cooldown
 fix-my-claw repair --force --json
 
@@ -134,6 +140,8 @@ Default AI fallback behavior:
 - automatic order: `codex`, then `claude`
 
 `acpx openclaw` is supported when explicitly selected, but it is not part of the default `auto` order because it depends on the Gateway-backed `openclaw acp` path.
+
+`fix-my-claw probe` goes a step further than `check`: it validates the configured repair methods, dry-runs official repair commands with `--help`, checks whether the configured argv references real paths, and can perform live AI dry-runs to verify that auth is actually usable instead of merely installed.
 
 ## 🔌 OpenClaw and AI Integration
 

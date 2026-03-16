@@ -88,6 +88,12 @@ fix-my-claw init
 # 单次探测，并输出机器可读 JSON
 fix-my-claw check --json
 
+# 对每种修复路径做 dry-run，包括 AI backend、配置参数和路径检查
+fix-my-claw probe --json
+
+# 跳过 live AI 调用，只检查静态前置条件和 dry-run 语法
+fix-my-claw probe --no-live-ai --json
+
 # 忽略冷却限制，强制执行一次修复
 fix-my-claw repair --force --json
 
@@ -134,6 +140,8 @@ fix-my-claw monitor --config /etc/fix-my-claw/config.toml
 - 自动顺序：`codex`，然后 `claude`
 
 `acpx openclaw` 依然支持，但不会被放进默认 `auto` 顺序，因为它底层依赖 Gateway-backed 的 `openclaw acp`。
+
+`fix-my-claw probe` 比 `check` 更进一步：它会校验配置里的修复路径，用 `--help` 对官方修复命令做 dry-run，检查当前 argv 里引用的路径是否真实存在，并且可以做 live AI dry-run，确认你不是“只装了命令”，而是真的把 auth 和执行链路都配通了。
 
 ## 🔌 OpenClaw 与 AI 集成
 

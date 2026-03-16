@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from string import Template
@@ -20,6 +20,16 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 log = logging.getLogger("fix_my_claw")
+
+AI_PROBE_TOKEN = "FIX_MY_CLAW_PROBE_OK"
+AI_PROBE_PROMPT = (
+    "This is a fix-my-claw dry-run capability probe.\n"
+    "Do not modify files.\n"
+    "Do not run commands.\n"
+    "Do not inspect the workspace.\n"
+    "Do not use any tools.\n"
+    f"Reply with exactly: {AI_PROBE_TOKEN}\n"
+)
 
 DEFAULT_CONFIG_PATH = "~/.fix-my-claw/config.toml"
 
@@ -832,6 +842,40 @@ class CheckResult:
         return {"healthy": self.healthy, "health": self.health, "status": self.status}
 
 
+@dataclass(frozen=True)
+class CapabilityCheck:
+    name: str
+    status: str  # ok | warn | fail | skip
+    summary: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "fail"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "summary": self.summary,
+            "details": self.details,
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityReport:
+    ok: bool
+    checks: list[dict[str, Any]]
+    summary: dict[str, int]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "checks": self.checks,
+            "summary": self.summary,
+        }
+
+
 def run_check(cfg: AppConfig, store: StateStore) -> CheckResult:
     h = probe_health(cfg)
     s = probe_status(cfg)
@@ -839,6 +883,317 @@ def run_check(cfg: AppConfig, store: StateStore) -> CheckResult:
     if healthy:
         store.mark_ok()
     return CheckResult(healthy=healthy, health=h.to_json(), status=s.to_json())
+
+
+def _probe_summary_counts(checks: list[CapabilityCheck]) -> dict[str, int]:
+    counts = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+    for check in checks:
+        counts[check.status] = counts.get(check.status, 0) + 1
+    counts["total"] = len(checks)
+    return counts
+
+
+def _nearest_existing_parent(path: Path) -> Path | None:
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+    return current
+
+
+def _probe_path_check(
+    name: str,
+    path: Path,
+    *,
+    can_create: bool,
+    missing_status: str = "warn",
+) -> CapabilityCheck:
+    if path.exists():
+        return CapabilityCheck(name=name, status="ok", summary=f"{path} exists", details={"path": str(path)})
+
+    parent = _nearest_existing_parent(path)
+    writable = bool(parent and os.access(parent, os.W_OK | os.X_OK))
+    details = {
+        "path": str(path),
+        "nearest_existing_parent": str(parent) if parent is not None else None,
+        "parent_writable": writable,
+    }
+    if can_create and writable:
+        return CapabilityCheck(
+            name=name,
+            status="warn",
+            summary=f"{path} does not exist yet; fix-my-claw can create it on first run",
+            details=details,
+        )
+    return CapabilityCheck(
+        name=name,
+        status=missing_status,
+        summary=f"{path} does not exist",
+        details=details,
+    )
+
+
+def _render_runtime_probe(name: str, probe: Probe) -> CapabilityCheck:
+    details = {
+        "argv": probe.cmd.argv,
+        "exit_code": probe.cmd.exit_code,
+        "duration_ms": probe.cmd.duration_ms,
+        "stderr": redact_text(probe.cmd.stderr),
+        "stdout": redact_text(probe.cmd.stdout),
+        "json": probe.json_data,
+    }
+    if probe.cmd.ok and probe.ok:
+        return CapabilityCheck(name=name, status="ok", summary="probe succeeded", details=details)
+    if probe.cmd.ok:
+        return CapabilityCheck(name=name, status="warn", summary="probe ran but reported unhealthy", details=details)
+    return CapabilityCheck(name=name, status="fail", summary="probe command failed", details=details)
+
+
+def _probe_gateway_mode_check(cfg: AppConfig) -> CapabilityCheck:
+    res = _run_openclaw_config_cmd(cfg, ["get", "gateway.mode", "--json"])
+    details = {
+        "argv": res.argv,
+        "exit_code": res.exit_code,
+        "duration_ms": res.duration_ms,
+        "stdout": redact_text(res.stdout),
+        "stderr": redact_text(res.stderr),
+        "allow_remote_mode": cfg.openclaw.allow_remote_mode,
+    }
+    if not res.ok:
+        return CapabilityCheck(
+            name="config.gateway_mode",
+            status="fail",
+            summary="could not read OpenClaw gateway.mode",
+            details=details,
+        )
+
+    mode = _parse_json_scalar(res.stdout)
+    details["mode"] = mode
+    if mode == "remote" and not cfg.openclaw.allow_remote_mode:
+        return CapabilityCheck(
+            name="config.gateway_mode",
+            status="fail",
+            summary="gateway.mode=remote is blocked by default",
+            details=details,
+        )
+    if mode == "remote":
+        return CapabilityCheck(
+            name="config.gateway_mode",
+            status="warn",
+            summary="gateway.mode=remote is allowed by config; repairs may target the wrong host",
+            details=details,
+        )
+    if isinstance(mode, str):
+        return CapabilityCheck(
+            name="config.gateway_mode",
+            status="ok",
+            summary=f"gateway.mode={mode}",
+            details=details,
+        )
+    return CapabilityCheck(
+        name="config.gateway_mode",
+        status="warn",
+        summary="gateway.mode returned an unexpected value",
+        details=details,
+    )
+
+
+def _build_official_step_probe_argv(cfg: AppConfig, step: list[str]) -> tuple[list[str], list[str]]:
+    argv = [cfg.openclaw.command if step and step[0] == "openclaw" else step[0], *step[1:]]
+    if step and step[0] == "openclaw":
+        return argv, [cfg.openclaw.command, *step[1:], "--help"]
+    return argv, [argv[0], "--help"]
+
+
+def _probe_official_step(cfg: AppConfig, step: list[str], idx: int) -> CapabilityCheck:
+    argv, dry_run_argv = _build_official_step_probe_argv(cfg, step)
+    res = run_cmd(
+        dry_run_argv,
+        timeout_seconds=min(max(5, cfg.monitor.probe_timeout_seconds), 15),
+        cwd=_openclaw_cwd(cfg),
+    )
+    details = {
+        "argv": argv,
+        "dry_run_argv": dry_run_argv,
+        "exit_code": res.exit_code,
+        "duration_ms": res.duration_ms,
+        "stdout": redact_text(res.stdout),
+        "stderr": redact_text(res.stderr),
+    }
+    return CapabilityCheck(
+        name=f"repair.official.{idx}",
+        status="ok" if res.ok else "fail",
+        summary="dry-run syntax check passed" if res.ok else "dry-run syntax check failed",
+        details=details,
+    )
+
+
+def _extract_invocation_paths(argv: list[str]) -> list[tuple[str, Path]]:
+    out: list[tuple[str, Path]] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"-C", "--cwd", "--add-dir"} and i + 1 < len(argv):
+            out.append((arg, Path(argv[i + 1]).expanduser()))
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _validate_invocation_paths(argv: list[str]) -> list[str]:
+    issues: list[str] = []
+    for flag, path in _extract_invocation_paths(argv):
+        if not path.exists():
+            issues.append(f"{flag} path does not exist: {path}")
+    return issues
+
+
+def _resolve_probe_ai_targets(cfg: AppConfig) -> list[tuple[str, str]]:
+    configured_backend = _normalize_ai_backend(cfg.ai.backend)
+    configured = [(configured_backend, provider) for provider in _resolve_ai_provider_candidates(cfg)]
+    supported = [
+        ("acpx", "codex"),
+        ("acpx", "claude"),
+        ("acpx", "openclaw"),
+        ("direct", "codex"),
+        ("direct", "openclaw"),
+    ]
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in [*configured, *supported]:
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
+
+
+def _build_probe_cfg(cfg: AppConfig, backend: str, provider: str) -> AppConfig:
+    return replace(
+        cfg,
+        ai=replace(
+            cfg.ai,
+            backend=backend,
+            provider=provider,
+        ),
+    )
+
+
+def _probe_ai_capability(
+    cfg: AppConfig,
+    *,
+    backend: str,
+    provider: str,
+    live: bool,
+    live_timeout_seconds: int,
+) -> CapabilityCheck:
+    probe_cfg = _build_probe_cfg(cfg, backend, provider)
+    static_probe = _probe_ai_provider(probe_cfg, provider)
+    argv, stdin_text = _build_ai_invocation(
+        probe_cfg,
+        AI_PROBE_PROMPT,
+        code_stage=False,
+        provider_override=provider,
+    )
+    path_issues = _validate_invocation_paths(argv)
+    details: dict[str, Any] = {
+        "backend": backend,
+        "provider": provider,
+        "argv": argv,
+        "stdin_preview": AI_PROBE_PROMPT if stdin_text is not None else None,
+        "path_issues": path_issues,
+        "static_probe": static_probe.to_json(),
+    }
+    if not static_probe.available:
+        return CapabilityCheck(
+            name=f"ai.{backend}.{provider}",
+            status="fail",
+            summary=f"static probe failed: {static_probe.reason}",
+            details=details,
+        )
+    if path_issues:
+        return CapabilityCheck(
+            name=f"ai.{backend}.{provider}",
+            status="fail",
+            summary="configured argv references missing paths",
+            details=details,
+        )
+    if not live:
+        return CapabilityCheck(
+            name=f"ai.{backend}.{provider}",
+            status="warn",
+            summary="static probe passed; live AI dry-run skipped",
+            details=details,
+        )
+
+    cmd = run_cmd(
+        argv,
+        timeout_seconds=max(5, live_timeout_seconds),
+        cwd=probe_cfg.openclaw.workspace_dir if probe_cfg.openclaw.workspace_dir.exists() else None,
+        stdin_text=stdin_text,
+    )
+    details["live_result"] = {
+        "exit_code": cmd.exit_code,
+        "duration_ms": cmd.duration_ms,
+        "stdout": redact_text(cmd.stdout),
+        "stderr": redact_text(cmd.stderr),
+    }
+    return CapabilityCheck(
+        name=f"ai.{backend}.{provider}",
+        status="ok" if cmd.ok else "fail",
+        summary="live dry-run succeeded" if cmd.ok else "live dry-run failed",
+        details=details,
+    )
+
+
+def run_probe(cfg: AppConfig, *, live_ai: bool, ai_timeout_seconds: int) -> CapabilityReport:
+    checks: list[CapabilityCheck] = [
+        _probe_gateway_mode_check(cfg),
+        _probe_path_check("path.workspace_dir", cfg.openclaw.workspace_dir, can_create=False, missing_status="warn"),
+        _probe_path_check("path.openclaw_state_dir", cfg.openclaw.state_dir, can_create=False, missing_status="warn"),
+        _probe_path_check("path.monitor_state_dir", cfg.monitor.state_dir, can_create=True, missing_status="fail"),
+        _render_runtime_probe("openclaw.health", probe_health(cfg, log_on_fail=False)),
+        _render_runtime_probe("openclaw.status", probe_status(cfg, log_on_fail=False)),
+    ]
+    checks.extend(
+        _probe_official_step(cfg, step, idx)
+        for idx, step in enumerate(cfg.repair.official_steps, start=1)
+        if step
+    )
+    checks.extend(
+        _probe_ai_capability(
+            cfg,
+            backend=backend,
+            provider=provider,
+            live=live_ai,
+            live_timeout_seconds=ai_timeout_seconds,
+        )
+        for backend, provider in _resolve_probe_ai_targets(cfg)
+    )
+    summary = _probe_summary_counts(checks)
+    return CapabilityReport(
+        ok=not any(check.failed for check in checks),
+        checks=[check.to_json() for check in checks],
+        summary=summary,
+    )
+
+
+def _render_probe_report(report: CapabilityReport) -> str:
+    lines = [
+        (
+            "probe summary: "
+            f"{report.summary.get('ok', 0)} ok, "
+            f"{report.summary.get('warn', 0)} warn, "
+            f"{report.summary.get('fail', 0)} fail, "
+            f"{report.summary.get('skip', 0)} skip"
+        )
+    ]
+    for check in report.checks:
+        status = str(check["status"]).upper().ljust(4)
+        lines.append(f"[{status}] {check['name']}: {check['summary']}")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -1520,6 +1875,22 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if result.healthy else 1
 
 
+def cmd_probe(args: argparse.Namespace) -> int:
+    cfg = _load_or_init_config(args.config, init_if_missing=False)
+    setup_logging(cfg)
+    _log_startup(cfg, mode="probe", config_path=args.config)
+    report = run_probe(
+        cfg,
+        live_ai=not args.no_live_ai,
+        ai_timeout_seconds=args.ai_timeout_seconds,
+    )
+    if args.json:
+        print(json.dumps(report.to_json(), ensure_ascii=False))
+    else:
+        print(_render_probe_report(report))
+    return 0 if report.ok else 1
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
     cfg = _load_or_init_config(args.config, init_if_missing=False)
     setup_logging(cfg)
@@ -1602,6 +1973,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(p_check)
     p_check.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     p_check.set_defaults(func=cmd_check)
+
+    p_probe = sub.add_parser(
+        "probe",
+        help="Dry-run capability probe for repair paths, commands, and AI backends.",
+    )
+    _add_config_arg(p_probe)
+    p_probe.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    p_probe.add_argument(
+        "--no-live-ai",
+        action="store_true",
+        help="Skip live AI dry-runs; only run static command/path/config checks.",
+    )
+    p_probe.add_argument(
+        "--ai-timeout-seconds",
+        type=int,
+        default=45,
+        help="Outer timeout for each live AI dry-run (default: 45).",
+    )
+    p_probe.set_defaults(func=cmd_probe)
 
     p_repair = sub.add_parser("repair", help="Run official repair (and optional AI repair) once if unhealthy.")
     _add_config_arg(p_repair)
