@@ -5,36 +5,43 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
+[![OpenClaw](https://img.shields.io/badge/openclaw-self--healing-0ea5e9.svg)](#how-it-works)
 
 Keep OpenClaw healthy without babysitting it.
 
-`fix-my-claw` is a small watchdog for long-running OpenClaw hosts. It probes gateway health and status, runs your official recovery steps, and stores a timestamped incident bundle for each failed repair. If you already recover OpenClaw with `openclaw doctor --repair --non-interactive` and `openclaw gateway restart`, `fix-my-claw` turns that playbook into a guarded loop with cooldowns, locking, and optional AI escalation.
+`fix-my-claw` is a watchdog and self-healing CLI for long-running OpenClaw hosts. It checks Gateway health, runs official recovery commands first, stores a timestamped incident bundle, and only escalates to AI when the standard playbook fails. The default AI path now uses `acpx` to try coding agents such as Codex and Claude without turning your README into a maze of manual recovery steps.
 
-[Features](#features) • [Installation](#installation) • [Quick Start](#quick-start) • [Configuration](#configuration) • [Systemd Deployment](#systemd-deployment) • [Docs](#documentation)
+[Why](#why-fix-my-claw) • [Install](#install) • [Quick Start](#quick-start) • [How It Works](#how-it-works) • [Configuration](#configuration) • [Systemd](#systemd-deployment) • [Docs](#documentation)
 
 ```mermaid
 flowchart LR
-  A["Probe gateway health and status"] --> B{"Healthy?"}
+  A["Probe gateway health + status"] --> B{"Healthy?"}
   B -->|"Yes"| C["Sleep until next interval"]
   B -->|"No"| D["Run official repair steps"]
   D --> E{"Recovered?"}
   E -->|"Yes"| C
-  E -->|"No"| F["Optional AI remediation"]
-  F --> C
+  E -->|"No"| F["Run AI fallback via acpx"]
+  F --> G{"Recovered?"}
+  G -->|"Yes"| C
+  G -->|"No"| H["Write incident bundle and wait"]
 ```
 
-## Features
+<a id="why-fix-my-claw"></a>
 
-- OpenClaw-aware checks via `gateway health` and `gateway status`
-- Official-first recovery with configurable `repair.official_steps`
-- Incident bundles under `~/.fix-my-claw/attempts/<timestamp>/`
-- Cooldowns, stale-lock cleanup, and single-instance protection
-- AI-assisted remediation enabled in the default config
-- Ready-to-use systemd units for long-running or timer-based deployment
+## ✨ Why fix-my-claw
 
-## Installation
+- 🩺 **OpenClaw-aware probes** with `gateway health` and `gateway status --require-rpc`
+- 🛠️ **Official-first recovery** before any AI escalation
+- 🤖 **AI fallback enabled by default** with `acpx` and automatic provider selection
+- 🧷 **Safety guards** for cooldowns, stale locks, single-instance execution, and remote-mode mismatch
+- 📦 **Incident bundles** under `~/.fix-my-claw/attempts/<timestamp>/` for every failed attempt
+- 🖥️ **Deployable as a service** with ready-to-use `systemd` units and a timer
 
-`fix-my-claw` is a Python CLI tool. The simplest install path is directly from GitHub:
+<a id="install"></a>
+
+## 🚀 Install
+
+`fix-my-claw` is a Python CLI tool. The fastest path is to install it from GitHub:
 
 ```bash
 python3 -m venv .venv
@@ -42,38 +49,37 @@ source .venv/bin/activate
 pip install git+https://github.com/caopulan/fix-my-claw.git
 ```
 
-If you already have the repo checked out locally:
+If you already have the repository:
 
 ```bash
 pip install .
 ```
 
-## Requirements
+<a id="requirements"></a>
+
+## 📋 Requirements
 
 - Python 3.9+
 - OpenClaw installed and callable as `openclaw`
 - Access to the OpenClaw state and workspace directories on the target host
-- Best deployed on the Gateway host itself; remote-only `gateway.mode=remote` setups need extra care because OpenClaw CLI probes may target a remote URL while local file repairs still touch the current machine
+- `acpx` installed if you want to use the default AI backend as-is
+- Best deployed on the Gateway host itself
 
 If `openclaw` is not on `PATH`, set `[openclaw].command` to an absolute path in the config file.
 
-## Quick Start
+<a id="quick-start"></a>
 
-Start the watchdog with default settings:
+## ⚡ Quick Start
+
+Start the watchdog with the default config:
 
 ```bash
 fix-my-claw up
 ```
 
-That command will create a default config if needed, then start the monitor loop.
+That command creates `~/.fix-my-claw/config.toml` if needed, then starts the monitor loop.
 
-Default paths:
-
-- Config: `~/.fix-my-claw/config.toml`
-- Log file: `~/.fix-my-claw/fix-my-claw.log`
-- Repair artifacts: `~/.fix-my-claw/attempts/<timestamp>/`
-
-Useful one-shot commands:
+Common one-shot commands:
 
 ```bash
 # Write the default config and print its path
@@ -85,13 +91,53 @@ fix-my-claw check --json
 # Force one repair attempt, ignoring cooldown
 fix-my-claw repair --force --json
 
-# Run with a non-default config path
+# Run the monitor loop with a custom config path
 fix-my-claw monitor --config /etc/fix-my-claw/config.toml
 ```
 
-## OpenClaw Integration
+Default paths:
 
-Out of the box, `fix-my-claw` uses the same OpenClaw commands an operator would run manually:
+- Config: `~/.fix-my-claw/config.toml`
+- Log file: `~/.fix-my-claw/fix-my-claw.log`
+- Incident bundles: `~/.fix-my-claw/attempts/<timestamp>/`
+
+Example console output:
+
+```text
+00:05:52 | START  | mode=up config=/Users/me/.fix-my-claw/config.toml
+00:05:52 | WATCH  | watching every 60s log=/Users/me/.fix-my-claw/fix-my-claw.log
+00:06:06 | PROBE  | status probe failed: rpc unavailable
+00:06:08 | REPAIR | official 1/2 run=openclaw doctor --repair --non-interactive
+00:06:32 | AI     | config stage backend=acpx providers=codex:ok, claude:ok
+```
+
+<a id="how-it-works"></a>
+
+## 🧠 How It Works
+
+`fix-my-claw` follows the same playbook a human operator would use, but wraps it with guards and repeatable automation:
+
+1. Probe OpenClaw with:
+   - `openclaw gateway health --json`
+   - `openclaw gateway status --json --require-rpc`
+2. If the Gateway is unhealthy, run official repair steps:
+   - `openclaw doctor --repair --non-interactive`
+   - `openclaw gateway restart`
+3. If OpenClaw is still unhealthy, enter AI fallback.
+4. Write the full attempt context, command outputs, and logs to an incident bundle.
+
+Default AI fallback behavior:
+
+- `ai.enabled = true`
+- `ai.backend = "acpx"`
+- `ai.provider = "auto"`
+- automatic order: `codex`, then `claude`
+
+`acpx openclaw` is supported when explicitly selected, but it is not part of the default `auto` order because it depends on the Gateway-backed `openclaw acp` path.
+
+## 🔌 OpenClaw and AI Integration
+
+### OpenClaw commands used out of the box
 
 - Health probe: `openclaw gateway health --json`
 - Status probe: `openclaw gateway status --json --require-rpc`
@@ -100,9 +146,31 @@ Out of the box, `fix-my-claw` uses the same OpenClaw commands an operator would 
   - `openclaw doctor --repair --non-interactive`
   - `openclaw gateway restart`
 
-You can override the command path, probe arguments, and repair steps in the config.
+### AI backends
 
-## Configuration
+- `backend = "acpx"`: default unified interface for supported coding agents
+- `backend = "direct"`: native integrations such as `codex exec` and `openclaw agent`
+
+When `backend = "acpx"` and `provider = "auto"`:
+
+- `fix-my-claw` probes `acpx`, then checks whether `codex` and `claude` are callable
+- the first usable provider is tried first
+- if it does not restore health, the next usable provider is tried automatically
+- AI runs are one-shot `acpx <provider> exec --file -` commands with stdin prompts
+
+When `backend = "direct"` and `provider = "auto"`:
+
+- the order is `codex`, then `openclaw`
+- `openclaw` availability is checked with `openclaw models status --check --json`
+- `provider = "openclaw"` can use `openclaw agent --local` to bypass the Gateway
+
+Second-stage AI remediation is still opt-in:
+
+- set `ai.allow_code_changes = true` to let the AI move from config/state repair to broader code or installation changes
+
+<a id="configuration"></a>
+
+## ⚙️ Configuration
 
 All runtime settings live in one TOML file. Generate it with `fix-my-claw init`, or start from [examples/fix-my-claw.toml](examples/fix-my-claw.toml).
 
@@ -114,90 +182,21 @@ Key settings:
 | `[monitor].repair_cooldown_seconds` | Minimum delay between repair attempts |
 | `[openclaw].command` | Absolute path to `openclaw` when `PATH` differs under systemd |
 | `[openclaw].allow_remote_mode` | Allow running even when OpenClaw is configured with `gateway.mode=remote` |
-| `[repair].official_steps` | The ordered recovery commands to run before AI escalation |
+| `[repair].official_steps` | Ordered recovery commands to run before AI escalation |
 | `[ai].enabled` | Whether AI-assisted remediation is allowed |
-| `[ai].backend` | `direct` or `acpx`; direct keeps native CLIs, acpx routes through the ACP client layer |
-| `[ai].provider` | `auto`, `codex`, `claude`, or `openclaw`; the candidate order depends on the backend |
+| `[ai].backend` | `acpx` or `direct` |
+| `[ai].provider` | `auto`, `codex`, `claude`, or `openclaw` |
 | `[ai].local` | When using `provider = "openclaw"`, bypass the Gateway with `openclaw agent --local` |
-| `[ai].acpx_permissions` | Permission mode used for `acpx` runs, typically `approve-all` for unattended fixes |
-| `[ai].allow_code_changes` | Whether a second-stage Codex run may make broader code or installation changes |
+| `[ai].acpx_permissions` | Permission mode for unattended `acpx` runs |
+| `[ai].allow_code_changes` | Whether a second AI stage may make broader code changes |
 
-The default config stores all state under `~/.fix-my-claw`, so the tool remains self-contained and easy to inspect.
+Safety defaults worth knowing:
 
-By default, `fix-my-claw` refuses to run if `openclaw config get gateway.mode --json` returns `"remote"`. This avoids the most dangerous mismatch: probing a remote Gateway while local repair steps still edit the current machine. Override that only with `[openclaw].allow_remote_mode = true`.
+- `fix-my-claw` refuses to run by default when `gateway.mode=remote`
+- AI runs are rate-limited by per-day limits and cooldowns
+- the default config keeps all state under `~/.fix-my-claw`
 
-## Systemd Deployment
-
-Linux deployment files live in [deploy/systemd](deploy/systemd):
-
-- `fix-my-claw.service`: recommended long-running monitor loop
-- `fix-my-claw-oneshot.service` + `fix-my-claw.timer`: periodic repair attempts
-
-Example using the long-running service:
-
-```bash
-sudo mkdir -p /etc/fix-my-claw
-sudo cp examples/fix-my-claw.toml /etc/fix-my-claw/config.toml
-
-sudo cp deploy/systemd/fix-my-claw.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now fix-my-claw.service
-```
-
-Notes for systemd hosts:
-
-- The sample unit runs `/usr/bin/env fix-my-claw ...`. If you installed inside a virtualenv, replace `ExecStart` with the absolute path to that virtualenv's `fix-my-claw` binary.
-- If `openclaw` is not found in the systemd environment, set `[openclaw].command` to an absolute path.
-
-## AI-Assisted Remediation
-
-AI-assisted remediation is enabled in the default config.
-
-There are now 2 AI backends:
-
-- `backend = "acpx"`: the default unified path for supported coding agents through [`acpx`](https://github.com/openclaw/acpx)
-- `backend = "direct"`: optional native integrations such as `codex exec` and `openclaw agent`
-
-In the default config, AI fallback runs with:
-
-- `backend = "acpx"`
-- `provider = "auto"`
-- Current automatic order: `codex`, then `claude`
-- `acpx openclaw` remains available when explicitly selected, but it is not part of the default `auto` order because it depends on the Gateway-backed `openclaw acp` path
-
-When `backend = "direct"` and `provider = "auto"`:
-
-- `fix-my-claw` probes local `codex` and `openclaw` availability before AI fallback
-- Current order is `codex` first, then `openclaw`
-- `codex` is checked via CLI availability, while `openclaw` is checked via `openclaw models status --check --json`
-- If the first provider is unusable or the repair run fails to recover OpenClaw, the next usable provider is tried automatically
-
-When `backend = "acpx"` and `provider = "auto"`:
-
-- `fix-my-claw` probes `codex` first, then `claude`
-- `acpx openclaw` is supported, but it is intentionally not part of the default `auto` order because `openclaw acp` is backed by the Gateway
-- This makes `acpx` the default unified interface for Codex/Claude-style coding agents, but not the default path for Gateway-down OpenClaw model recovery
-
-When using the direct backend with `provider = "codex"`:
-
-- The first stage runs `codex exec` in `workspace-write` mode with explicitly added directories
-- The second stage is still disabled unless `ai.allow_code_changes = true`
-- Daily attempt limits and cooldowns reduce the chance of repeated AI runs on the same host
-
-When using the direct backend with `provider = "openclaw"`:
-
-- `fix-my-claw` runs `openclaw agent`
-- Set `local = true` to bypass the Gateway and use the embedded agent path directly
-- This is the path to use when the Gateway is already down but the host still has working OpenClaw model/provider credentials
-- If `provider` is explicitly pinned to `openclaw`, `codex` is still kept as the next provider-level fallback
-
-When using the `acpx` backend:
-
-- `fix-my-claw` runs one-shot `acpx <provider> exec --file -` calls
-- The default `acpx` mode is non-interactive and auto-approved for unattended fixes
-- `acpx` itself is still alpha, so pinning the binary/version is safer for production automation
-
-Example:
+Example AI config:
 
 ```toml
 [ai]
@@ -211,17 +210,42 @@ acpx_format = "json"
 timeout_seconds = 1800
 ```
 
-If you want official repair steps only, set `[ai].enabled = false`.
+<a id="systemd-deployment"></a>
 
-## Trade-offs
+## 🖥️ Systemd Deployment
 
-- `fix-my-claw` automates recovery; it does not replace fixing the root cause in OpenClaw or the host
-- If you only need a periodic check, the timer-based deployment may be a better fit than a full monitor loop
-- The tool assumes it can read the relevant OpenClaw workspace and state directories
-- Using OpenClaw-registered models during a Gateway outage is possible only through a local/embedded path such as `openclaw agent --local` or another direct provider path; the normal Gateway routing path is unavailable while the Gateway is down
-- `acpx` is promising as a unified coding-agent interface, but it is still alpha and its `openclaw` target is Gateway-backed
+Linux deployment files live in [deploy/systemd](deploy/systemd):
 
-## Documentation
+- `fix-my-claw.service`: long-running monitor loop
+- `fix-my-claw-oneshot.service` + `fix-my-claw.timer`: periodic repair attempts
+
+Example:
+
+```bash
+sudo mkdir -p /etc/fix-my-claw
+sudo cp examples/fix-my-claw.toml /etc/fix-my-claw/config.toml
+
+sudo cp deploy/systemd/fix-my-claw.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fix-my-claw.service
+```
+
+Notes:
+
+- If you installed inside a virtualenv, replace `ExecStart` with the absolute path to that virtualenv's `fix-my-claw` binary.
+- If `openclaw` is not visible inside the `systemd` environment, set `[openclaw].command` to an absolute path.
+
+## ⚠️ Trade-offs and Boundaries
+
+- `fix-my-claw` automates recovery; it does not remove the need to fix root causes
+- `acpx` is a strong default interface for Codex/Claude-style remediation, but it is still alpha
+- `acpx openclaw` depends on the Gateway, so it is not the default AI fallback path for a dead Gateway
+- Using OpenClaw-registered models during a Gateway outage requires a local or embedded path such as `openclaw agent --local`
+- If you only need periodic checks, the timer-based deployment may be a better fit than a full monitor loop
+
+<a id="documentation"></a>
+
+## 📚 Documentation
 
 - [Example config](examples/fix-my-claw.toml)
 - [systemd deployment files](deploy/systemd)
@@ -231,18 +255,18 @@ If you want official repair steps only, set `[ai].enabled = false`.
 - [Security policy](SECURITY.md)
 - [Issue tracker](https://github.com/caopulan/fix-my-claw/issues)
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-For bug reports, include:
+Bug reports are much easier to triage when they include:
 
-- Your OS and Python version
-- Your OpenClaw version
-- The relevant `fix-my-claw` config, with secrets redacted
-- Recent logs from `~/.fix-my-claw/fix-my-claw.log`
-- The latest attempt directory under `~/.fix-my-claw/attempts/`
+- OS and Python version
+- OpenClaw version
+- relevant `fix-my-claw` config with secrets redacted
+- recent `~/.fix-my-claw/fix-my-claw.log`
+- the latest attempt directory under `~/.fix-my-claw/attempts/`
 
-## License
+## 📄 License
 
 [MIT](LICENSE) © fix-my-claw contributors
